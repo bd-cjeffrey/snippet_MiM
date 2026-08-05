@@ -14,6 +14,7 @@ different prompt.
 - `curl` and `jq` on `PATH` (used by `source_bearer_demo.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
 - A BlackDuck personal access token and a LiteLLM API key
+- Access to the SCA fingerprint jar file and java app, found at: https://blackduck.atlassian.net/wiki/spaces/SUCCESS/pages/1979417025/Black+Duck+Generative+AI+Compliance+SDK+Guide   
 
 ## Install
 
@@ -23,6 +24,9 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 chmod +x run_snippet_hash.sh source_bearer_demo.sh
 ```
+Download SCA fingerprint and java app (sca.java) from link. 
+Build sca.java app: 
+   javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
 
 ## Configure environment
 
@@ -216,26 +220,10 @@ Response fields:
    isn't clobbered).
 4. `find_reciprocal_matches` walks `snippetMatches.RECIPROCAL` and
    `snippetMatches.WEAK_RECIPROCAL` and flattens hits.
-5. If any hit is found, `build_rewrite_prompt` prepends the match list plus a
+5. If any hit is found, `build_rewrite_prompt` prepends a
    rewrite instruction to the original prompt and previous response, and the
    loop iterates. After `MIM_MAX_RETRIES` failed rewrites the proxy returns
    `clean: false` with a message telling the caller to try a different prompt.
-
-With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`), each match line
-in the rewrite prompt is followed by indented rows carrying `spdx`, ownership,
-the matched file path, and the source/matched line ranges pulled from
-`snippet_match.json`. Example:
-
-```
-  - [RECIPROCAL] 4MLinux 1.0.1g -> GNU General Public License v3.0 or later
-      spdx: GPL-3.0-or-later  (OPEN_SOURCE)
-      matched file: /openssl-1.0.1g/crypto/o_init.c
-      matched lines: 28-79
-      your lines:    29-81
-```
-
-Off by default because it adds tokens on every rewrite attempt; turn it on
-when you want the LLM to see which lines and which SPDX ids are at issue.
 
 ## Instrumentation
 
