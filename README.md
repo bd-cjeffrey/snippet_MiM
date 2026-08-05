@@ -1,22 +1,25 @@
 # MiM — Man-in-the-Middle License Guard
 
 A small HTTP proxy that sits between a coding agent and a LiteLLM-compatible
-LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It forwards prompts upstream and,
+LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It is a prototype that sits in a
+dev’s desktop but could be extended as a proxy server. It forwards LLM prompts upstream and,
 for every fenced code block in the response, runs BlackDuck's snippet-matching
 API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 `WEAK_RECIPROCAL`, the proxy re-prompts the LLM to rewrite the code without
 those matches. It gives up after 6 attempts and asks the caller to try a
 different prompt.
 
+Testing was performed with Claude and opus-4-7.
+
 This proxy sends SCA fingerprints instead of plaintext to the api/snippet-matching endpoint, 
-for better match results
+for better match results.  A link to download the SCA fingerprint utils is included below.
 
 ## Requirements
 
 - Python 3.9+
 - `curl` and `jq` on `PATH` (used by `source_bearer_demo.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
-- A BlackDuck personal access token and a LiteLLM API key
+- A BlackDuck SCA personal access token and a LiteLLM API key
 - Access to the SCA fingerprint jar file and java app, found at: https://blackduck.atlassian.net/wiki/spaces/SUCCESS/pages/1979417025/Black+Duck+Generative+AI+Compliance+SDK+Guide   
 
 ## Install
