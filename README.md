@@ -80,6 +80,10 @@ Command-line flags (each also mirrors an env var):
 ./.venv/bin/python mim_proxy.py -l debug -p 9090 -r 3
 ```
 
+**Direct your coding agent** to connect to the proxy, eg:
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+
+
 | Flag | Env var | Default |
 |---|---|---|
 | `-l`, `--log-level {off,warn,info,debug}` | `MIM_LOG_LEVEL` | `info` |
