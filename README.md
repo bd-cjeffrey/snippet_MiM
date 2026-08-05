@@ -7,7 +7,7 @@ for every fenced code block in the response, runs BlackDuck's snippet-matching
 API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 `WEAK_RECIPROCAL`, the proxy re-prompts the LLM to rewrite the code without
 those matches. It gives up after 6 attempts and asks the caller to try a
-different prompt.
+different prompt. In practice, we see 1 or 2 reprompts.
 
 Testing was performed with Claude and opus-4-7.
 
