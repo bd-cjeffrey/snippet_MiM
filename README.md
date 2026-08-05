@@ -8,6 +8,9 @@ API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 those matches. It gives up after 6 attempts and asks the caller to try a
 different prompt.
 
+This proxy sends SCA fingerprints instead of plaintext to the api/snippet-matching endpoint, 
+for better match results
+
 ## Requirements
 
 - Python 3.9+
