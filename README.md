@@ -87,6 +87,8 @@ Command-line flags (each also mirrors an env var):
 Direct your coding agent to connect to the proxy, eg:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 
+See ‘run_client_test.sh’ to show an example that forces the LLM to respond with OSS,
+and that causes the proxy to re-prompt for clean code
 
 
 
