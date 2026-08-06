@@ -30,7 +30,7 @@ Two sets of credentials are needed:
 
 1. **BlackDuck SCA** (used by `run_snippet_hash.sh` to call `/api/snippet-matching`).
    `source_bearer_demo.sh` exchanges a BlackDuck token for a short-lived bearer
-   and exports `BEARER_TOK` and `BLACKDUCK_HOST`:
+   and exports `BEARER_TOK` and `BLACKDUCK_HOST` and SCA auth token `BLACKDUCK_TOK`:
 
    ```bash
    source ./source_bearer_demo.sh
