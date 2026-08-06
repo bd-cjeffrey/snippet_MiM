@@ -9,6 +9,8 @@ API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 those matches. It gives up after 6 attempts and asks the caller to try a
 different prompt. In practice, we see 1 or 2 iterations.
 
+Open https://github.com/bd-cjeffrey/snippet_MiM/blob/main/README_flow.html in browser for visual.
+
 Testing was performed with Claude and opus-4-7.
 
 This proxy sends SCA fingerprints instead of plaintext to the api/snippet-matching endpoint, 
