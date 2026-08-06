@@ -38,6 +38,8 @@ chmod +x run_snippet_hash.sh source_bearer_demo.sh
 - Build sca.java app:   
 
 ```bash
+export JAVA_HOME=<openJDK install dir>
+export PATH=$JAVA_HOME:$PATH
 javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
 ```
 ## Configure environment
