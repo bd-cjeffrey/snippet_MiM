@@ -33,9 +33,9 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 chmod +x run_snippet_hash.sh source_bearer_demo.sh
 ```
-   Download SCA fingerprint and java app (sca.java) from link. 
-   Install OpenJDK 17
-   Build sca.java app: 
+- Download SCA fingerprint and java app (sca.java) from link.  
+- Install OpenJDK 17. 
+- Build sca.java app:   
 
 ```bash
 javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
