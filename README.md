@@ -1,29 +1,19 @@
 # MiM — Man-in-the-Middle License Guard
 
 A small HTTP proxy that sits between a coding agent and a LiteLLM-compatible
-LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It is a prototype that sits in a
-dev’s desktop but could be extended as a proxy server. It forwards LLM prompts upstream and,
+LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It forwards prompts upstream and,
 for every fenced code block in the response, runs BlackDuck's snippet-matching
 API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 `WEAK_RECIPROCAL`, the proxy re-prompts the LLM to rewrite the code without
 those matches. It gives up after 6 attempts and asks the caller to try a
-different prompt. In practice, we see 1 or 2 iterations.
-
-Open https://github.com/bd-cjeffrey/snippet_MiM/blob/main/README_flow.html in browser for visual.
-
-Testing was performed with Claude and opus-4-7.
-
-This proxy sends SCA fingerprints instead of plaintext to the api/snippet-matching endpoint, 
-for better match results.  A link to download the SCA fingerprint utils is included below.
+different prompt.
 
 ## Requirements
 
 - Python 3.9+
-- OpenJDK 17
 - `curl` and `jq` on `PATH` (used by `source_bearer_demo.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
-- A BlackDuck SCA personal access token and a LiteLLM API key
-- Access to the SCA fingerprint jar file and java app, found at: https://blackduck.atlassian.net/wiki/spaces/SUCCESS/pages/1979417025/Black+Duck+Generative+AI+Compliance+SDK+Guide   
+- A BlackDuck personal access token and a LiteLLM API key
 
 ## Install
 
@@ -33,15 +23,7 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 chmod +x run_snippet_hash.sh source_bearer_demo.sh
 ```
-- Download SCA fingerprint and java app (sca.java) from link.  
-- Install OpenJDK 17. 
-- Build sca.java app:   
 
-```bash
-export JAVA_HOME=<openJDK install dir>
-export PATH=$JAVA_HOME:$PATH
-javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
-```
 ## Configure environment
 
 Two sets of credentials are needed:
@@ -87,15 +69,6 @@ Command-line flags (each also mirrors an env var):
 ./.venv/bin/python mim_proxy.py --log-level debug          # or -l debug
 ./.venv/bin/python mim_proxy.py -l debug -p 9090 -r 3
 ```
-
-Direct your coding agent to connect to the proxy, eg:
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-```
-See ‘run_client_test.sh’ to show an example that forces the LLM to respond with OSS,
-and that causes the proxy to re-prompt for clean code
-
-
 
 | Flag | Env var | Default |
 |---|---|---|
@@ -237,16 +210,39 @@ Response fields:
    If the model returns raw code without fences (e.g., Claude Opus 4.7), the
    whole response is scanned instead and a `no_fences_using_whole_response`
    trace event is emitted.
-3. Blocks < 300 chars are concatenated into a single file; larger blocks are
-   scanned individually. Each file is written to a fresh tempdir and
+3. Blocks are grouped for scanning by size:
+   - **< 300 chars** are concatenated together into a single file (too small
+     to yield useful matches on their own).
+   - **300–50000 chars** each get their own file.
+   - **> 50000 chars** are split at line boundaries into chunks under 50000
+     chars so each request stays within the snippet-matching endpoint's
+     limit.
+
+   Each resulting file is written to a fresh tempdir and
    `run_snippet_hash.sh` is invoked there (so the repo's `snippet_match.json`
    isn't clobbered).
 4. `find_reciprocal_matches` walks `snippetMatches.RECIPROCAL` and
    `snippetMatches.WEAK_RECIPROCAL` and flattens hits.
-5. If any hit is found, `build_rewrite_prompt` prepends a
+5. If any hit is found, `build_rewrite_prompt` prepends the match list plus a
    rewrite instruction to the original prompt and previous response, and the
    loop iterates. After `MIM_MAX_RETRIES` failed rewrites the proxy returns
    `clean: false` with a message telling the caller to try a different prompt.
+
+With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`), each match line
+in the rewrite prompt is followed by indented rows carrying `spdx`, ownership,
+the matched file path, and the source/matched line ranges pulled from
+`snippet_match.json`. Example:
+
+```
+  - [RECIPROCAL] 4MLinux 1.0.1g -> GNU General Public License v3.0 or later
+      spdx: GPL-3.0-or-later  (OPEN_SOURCE)
+      matched file: /openssl-1.0.1g/crypto/o_init.c
+      matched lines: 28-79
+      your lines:    29-81
+```
+
+Off by default because it adds tokens on every rewrite attempt; turn it on
+when you want the LLM to see which lines and which SPDX ids are at issue.
 
 ## Instrumentation
 

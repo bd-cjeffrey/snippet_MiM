@@ -6,8 +6,10 @@ Flow per request:
   1. POST /proxy {"prompt": "..."}  ->  forward to $BLACKDUCK_MCP_GATEWAY_URL
   2. Extract fenced code blocks from the response; if none are present
      (e.g., Claude Opus emits raw code), fall back to the whole response.
-  3. Snippets < 300 chars are concatenated into a single file; larger blocks
-     get their own file. Each file is scanned by run_snippet_hash.sh.
+  3. Snippets < 300 chars are concatenated into a single file; snippets
+     300-50000 chars each get their own file; snippets > 50000 chars are
+     split at line boundaries into chunks under the limit. Each file is
+     scanned by run_snippet_hash.sh.
   4. If snippet_match.json reports RECIPROCAL or WEAK_RECIPROCAL matches,
      re-prompt the gateway to rewrite the code without those matches.
   5. Repeat until clean or MIM_MAX_RETRIES exhausted (default 6).
@@ -49,6 +51,7 @@ MAX_RETRIES = int(os.environ.get("MIM_MAX_RETRIES", "6"))
 LICENSE_DETAILS = os.environ.get("MIM_LICENSE_DETAILS", "").lower() in ("1", "true", "yes", "on")
 
 SMALL_SNIPPET_LIMIT = 300
+LARGE_SNIPPET_LIMIT = 50000
 #TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # for test purposes, trigger all categories
 TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -246,17 +249,36 @@ def extract_code_blocks(text: str) -> list:
     return [m.group(1) for m in FENCE_RE.finditer(text)]
 
 
+def split_oversize(content: str, limit: int) -> list:
+    """Split `content` into chunks no larger than `limit`, cutting at line
+    boundaries when possible."""
+    if len(content) <= limit:
+        return [content]
+    chunks = []
+    remaining = content
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def group_snippets(blocks: list) -> list:
-    """Large blocks scan individually; small blocks (< 300 chars) merge into one."""
+    """Blocks 300-50000 chars scan individually; smaller blocks merge into
+    one file; blocks over 50000 chars are split at line boundaries."""
     kept = [b for b in blocks if b]
     files, small = [], []
     for b in kept:
         if len(b) >= SMALL_SNIPPET_LIMIT:
-            files.append(b)
+            files.extend(split_oversize(b, LARGE_SNIPPET_LIMIT))
         else:
             small.append(b)
     if small:
-        files.append("\n\n".join(small))
+        files.extend(split_oversize("\n\n".join(small), LARGE_SNIPPET_LIMIT))
     return files
 
 
