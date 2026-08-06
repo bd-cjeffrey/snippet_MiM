@@ -7,7 +7,7 @@ for every fenced code block in the response, runs BlackDuck's snippet-matching
 API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 `WEAK_RECIPROCAL`, the proxy re-prompts the LLM to rewrite the code without
 those matches. It gives up after 6 attempts and asks the caller to try a
-different prompt. In practice, we see 1 or 2 reprompts.
+different prompt. In practice, we see 1 or 2 iterations.
 
 Testing was performed with Claude and opus-4-7.
 
@@ -17,6 +17,7 @@ for better match results.  A link to download the SCA fingerprint utils is inclu
 ## Requirements
 
 - Python 3.9+
+- OpenJDK 17
 - `curl` and `jq` on `PATH` (used by `source_bearer_demo.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
 - A BlackDuck SCA personal access token and a LiteLLM API key
@@ -31,6 +32,7 @@ python3 -m venv .venv
 chmod +x run_snippet_hash.sh source_bearer_demo.sh
 ```
 Download SCA fingerprint and java app (sca.java) from link. 
+Install OpenJDK 17
 Build sca.java app: 
    javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
 
