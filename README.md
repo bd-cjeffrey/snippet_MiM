@@ -36,8 +36,10 @@ chmod +x run_snippet_hash.sh source_bearer_demo.sh
 Download SCA fingerprint and java app (sca.java) from link. 
 Install OpenJDK 17
 Build sca.java app: 
-   javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
 
+```bash
+javac -cp .:sca-fingerprint-client-1.0.0.jar sca.java 
+```
 ## Configure environment
 
 Two sets of credentials are needed:
