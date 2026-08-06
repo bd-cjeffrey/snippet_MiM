@@ -30,7 +30,7 @@ Two sets of credentials are needed:
 
 1. **BlackDuck SCA** (used by `run_snippet_hash.sh` to call `/api/snippet-matching`).
    `source_bearer_demo.sh` exchanges a BlackDuck token for a short-lived bearer
-   and exports `BEARER_TOK` and `BLACKDUCK_HOST` and SCA auth token `BLACKDUCK_TOK`:
+   and exports `BEARER_TOK` and `BLACKDUCK_HOST`:
 
    ```bash
    source ./source_bearer_demo.sh
@@ -210,10 +210,13 @@ Response fields:
    If the model returns raw code without fences (e.g., Claude Opus 4.7), the
    whole response is scanned instead and a `no_fences_using_whole_response`
    trace event is emitted.
-3. Blocks < 300 chars are concatenated into a single file; larger blocks are
-   scanned individually. Each file is written to a fresh tempdir and
-   `run_snippet_hash.sh` is invoked there (so the repo's `snippet_match.json`
-   isn't clobbered).
+3. Snippet size is measured in non-whitespace characters. Blocks with
+   ≥ 300 non-whitespace chars are scanned individually; smaller blocks are
+   concatenated together and scanned as a single file — but only if the
+   merged blob itself reaches the 300 non-whitespace-char threshold,
+   otherwise it's dropped (too small to yield useful matches). Each file
+   is written to a fresh tempdir and `run_snippet_hash.sh` is invoked
+   there (so the repo's `snippet_match.json` isn't clobbered).
 4. `find_reciprocal_matches` walks `snippetMatches.RECIPROCAL` and
    `snippetMatches.WEAK_RECIPROCAL` and flattens hits.
 5. If any hit is found, `build_rewrite_prompt` prepends the match list plus a

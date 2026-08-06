@@ -6,8 +6,11 @@ Flow per request:
   1. POST /proxy {"prompt": "..."}  ->  forward to $BLACKDUCK_MCP_GATEWAY_URL
   2. Extract fenced code blocks from the response; if none are present
      (e.g., Claude Opus emits raw code), fall back to the whole response.
-  3. Snippets < 300 chars are concatenated into a single file; larger blocks
-     get their own file. Each file is scanned by run_snippet_hash.sh.
+  3. Snippets with < 300 non-whitespace chars are concatenated into a
+     single file; larger blocks get their own file. If the concatenated
+     small file is itself still below the threshold, it is dropped
+     (too small to yield useful matches). Each file is scanned by
+     run_snippet_hash.sh.
   4. If snippet_match.json reports RECIPROCAL or WEAK_RECIPROCAL matches,
      re-prompt the gateway to rewrite the code without those matches.
   5. Repeat until clean or MIM_MAX_RETRIES exhausted (default 6).
@@ -246,17 +249,27 @@ def extract_code_blocks(text: str) -> list:
     return [m.group(1) for m in FENCE_RE.finditer(text)]
 
 
+def _non_ws_len(s: str) -> int:
+    """Count of non-whitespace characters in `s`."""
+    return sum(1 for c in s if not c.isspace())
+
+
 def group_snippets(blocks: list) -> list:
-    """Large blocks scan individually; small blocks (< 300 chars) merge into one."""
+    """A snippet must have at least SMALL_SNIPPET_LIMIT non-whitespace chars
+    to be worth scanning. Blocks that meet the threshold scan individually;
+    smaller blocks are merged and only sent if their combined non-whitespace
+    length reaches the threshold."""
     kept = [b for b in blocks if b]
     files, small = [], []
     for b in kept:
-        if len(b) >= SMALL_SNIPPET_LIMIT:
+        if _non_ws_len(b) >= SMALL_SNIPPET_LIMIT:
             files.append(b)
         else:
             small.append(b)
     if small:
-        files.append("\n\n".join(small))
+        merged = "\n\n".join(small)
+        if _non_ws_len(merged) >= SMALL_SNIPPET_LIMIT:
+            files.append(merged)
     return files
 
 
