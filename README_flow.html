@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MiM Proxy — Overview</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --ink: #e2e8f0;
+    --mute: #94a3b8;
+    --client: #38bdf8;
+    --proxy: #a78bfa;
+    --llm: #34d399;
+    --sca: #fb923c;
+    --warn: #f43f5e;
+    --line: #64748b;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  .slide {
+    width: 1280px;
+    height: 780px;
+    margin: 24px auto;
+    padding: 32px 48px 28px;
+    background: linear-gradient(180deg, #0f172a 0%, #111c33 100%);
+    border: 1px solid #1f2a44;
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+    display: flex;
+    flex-direction: column;
+  }
+  h1 {
+    font-size: 28px;
+    margin: 0 0 4px 0;
+  }
+  .subtitle {
+    color: var(--mute);
+    font-size: 14px;
+    margin-bottom: 14px;
+  }
+
+  .diagram {
+    flex: 1;
+    position: relative;
+  }
+
+  .box {
+    position: absolute;
+    background: var(--panel);
+    border: 1.5px solid #334155;
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .box .role {
+    color: var(--mute);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .box .title {
+    font-size: 16px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .box ul {
+    margin: 4px 0 0 0;
+    padding-left: 16px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: #cbd5e1;
+  }
+  .box ul li + li { margin-top: 3px; }
+
+  .client { border-color: var(--client); left: 0;    top: 40px;  width: 220px; }
+  .proxy  { border-color: var(--proxy);  left: 400px; top: 20px;  width: 384px; }
+  .llm    { border-color: var(--llm);    left: 964px; top: 40px;  width: 220px; }
+  .sca    { border-color: var(--sca);    left: 400px; top: 400px; width: 384px; }
+
+  .client .dot { background: var(--client); }
+  .proxy  .dot { background: var(--proxy); }
+  .llm    .dot { background: var(--llm); }
+  .sca    .dot { background: var(--sca); }
+
+  .proxy .sub {
+    background: #0f172a;
+    border: 1px dashed #475569;
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-top: 4px;
+  }
+  .sub .sub-title {
+    font-size: 11px;
+    color: var(--sca);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-bottom: 3px;
+  }
+  .sub ul { padding-left: 14px; font-size: 12px; }
+
+  svg.wires {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+  }
+  .wire { stroke: var(--line); stroke-width: 2; fill: none; }
+  .wire-lbl {
+    fill: #cbd5e1;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wire-sub {
+    fill: var(--mute);
+    font-size: 11.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wire-loop {
+    fill: var(--warn);
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.3px;
+  }
+
+  .footer {
+    margin-top: 8px;
+    color: var(--mute);
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .kbd {
+    background: #0b1120;
+    border: 1px solid #334155;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: #e2e8f0;
+  }
+</style>
+</head>
+<body>
+  <div class="slide">
+    <h1>MiM Proxy — Scan &amp; Rewrite Loop</h1>
+    <div class="subtitle">
+      A transparent HTTP proxy that intercepts coding-agent requests, scans generated code for
+      reciprocal/copyleft license matches, and re-prompts the LLM until the response is clean.
+    </div>
+
+    <div class="diagram">
+      <svg class="wires" viewBox="0 0 1184 620" preserveAspectRatio="none">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerUnits="strokeWidth" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+          </marker>
+          <marker id="ah-warn" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerUnits="strokeWidth" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#f43f5e"/>
+          </marker>
+        </defs>
+
+        <!-- Client <-> Proxy (gap: x=220 to x=400, 180px wide) -->
+        <path class="wire" d="M 225,110 L 395,110" marker-end="url(#ah)"/>
+        <path class="wire" d="M 395,150 L 225,150" marker-end="url(#ah)"/>
+        <text class="wire-lbl" x="232" y="102">1. prompt  (HTTP)</text>
+        <text class="wire-sub" x="232" y="170">6. clean response</text>
+
+        <!-- Proxy <-> LLM (gap: x=784 to x=964, 180px wide) -->
+        <path class="wire" d="M 789,110 L 959,110" marker-end="url(#ah)"/>
+        <path class="wire" d="M 959,150 L 789,150" marker-end="url(#ah)"/>
+        <text class="wire-lbl" x="796" y="102">2. forward prompt</text>
+        <text class="wire-sub" x="796" y="170">3. code reply</text>
+
+        <!-- Retry loop: LLM back to Proxy, arc through empty space below LLM -->
+        <path class="wire" d="M 964 265 C 964 320, 784 320, 784 265"
+              stroke-dasharray="5,4" stroke="#f43f5e" marker-end="url(#ah-warn)"/>
+        <text class="wire-loop" x="798" y="345">↻ 5. rewrite prompt on reciprocal hits</text>
+
+        <!-- Proxy <-> Black Duck SCA (vertical, gap ~y=245 to y=400) -->
+        <path class="wire" d="M 470,355 L 470,395" marker-end="url(#ah)"/>
+        <path class="wire" d="M 714,395 L 714,355" marker-end="url(#ah)"/>
+        <text class="wire-lbl" x="482" y="370">4a. POST snippet  (SCA API)</text>
+        <text class="wire-sub" x="482" y="390">4b. snippet_match.json</text>
+      </svg>
+
+      <!-- CLIENT -->
+      <div class="box client">
+        <div class="role">Client</div>
+        <div class="title"><span class="dot"></span>Coding Agent</div>
+        <ul>
+          <li>e.g. Claude Code, Cursor, cURL</li>
+          <li>LLM endpoint pointed at proxy</li>
+          <li>OpenAI or Anthropic chat API</li>
+        </ul>
+      </div>
+
+      <!-- PROXY -->
+      <div class="box proxy">
+        <div class="role">Man-in-the-Middle</div>
+        <div class="title"><span class="dot"></span>mim_proxy.py</div>
+        <ul>
+          <li>Extracts prompt · forwards to LLM · inspects reply</li>
+          <li>Passes non-prompt traffic through untouched</li>
+        </ul>
+        <div class="sub">
+          <div class="sub-title">Per response</div>
+          <ul>
+            <li>Pull code from fenced blocks (or whole reply)</li>
+            <li>Send each snippet to Black Duck SCA</li>
+            <li>On reciprocal hits → build rewrite prompt &amp; retry</li>
+            <li>Return clean response or give-up notice</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- LLM -->
+      <div class="box llm">
+        <div class="role">Upstream</div>
+        <div class="title"><span class="dot"></span>LLM Gateway</div>
+        <ul>
+          <li>LiteLLM / MCP gateway</li>
+          <li>Generates code for the prompt</li>
+          <li>Re-invoked on each rewrite pass</li>
+        </ul>
+      </div>
+
+      <!-- BLACK DUCK SCA -->
+      <div class="box sca">
+        <div class="role">License Scanner</div>
+        <div class="title"><span class="dot"></span>Black Duck SCA</div>
+        <ul>
+          <li>Called via <span class="kbd">run_snippet_hash.sh</span> at <span class="kbd">BLACKDUCK_HOST</span></li>
+          <li>Hashes snippet → matches against KnowledgeBase</li>
+          <li>Returns <span class="kbd">snippetMatches</span> grouped by license category (RECIPROCAL, PERMISSIVE, …)</li>
+          <li>Proxy triggers only on RECIPROCAL / WEAK_RECIPROCAL</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div>Env: <span class="kbd">BLACKDUCK_MCP_GATEWAY_URL</span> · <span class="kbd">BEARER_TOK</span> · <span class="kbd">BLACKDUCK_HOST</span></div>
+      <div>Observability: <span class="kbd">/health</span> · <span class="kbd">/traces</span></div>
+    </div>
+  </div>
+</body>
+</html>
