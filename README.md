@@ -210,15 +210,8 @@ Response fields:
    If the model returns raw code without fences (e.g., Claude Opus 4.7), the
    whole response is scanned instead and a `no_fences_using_whole_response`
    trace event is emitted.
-3. Blocks are grouped for scanning by size:
-   - **< 300 chars** are concatenated together into a single file (too small
-     to yield useful matches on their own).
-   - **300–50000 chars** each get their own file.
-   - **> 50000 chars** are split at line boundaries into chunks under 50000
-     chars so each request stays within the snippet-matching endpoint's
-     limit.
-
-   Each resulting file is written to a fresh tempdir and
+3. Blocks < 300 chars are concatenated into a single file; larger blocks are
+   scanned individually. Each file is written to a fresh tempdir and
    `run_snippet_hash.sh` is invoked there (so the repo's `snippet_match.json`
    isn't clobbered).
 4. `find_reciprocal_matches` walks `snippetMatches.RECIPROCAL` and

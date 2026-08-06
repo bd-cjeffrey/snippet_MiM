@@ -6,10 +6,8 @@ Flow per request:
   1. POST /proxy {"prompt": "..."}  ->  forward to $BLACKDUCK_MCP_GATEWAY_URL
   2. Extract fenced code blocks from the response; if none are present
      (e.g., Claude Opus emits raw code), fall back to the whole response.
-  3. Snippets < 300 chars are concatenated into a single file; snippets
-     300-50000 chars each get their own file; snippets > 50000 chars are
-     split at line boundaries into chunks under the limit. Each file is
-     scanned by run_snippet_hash.sh.
+  3. Snippets < 300 chars are concatenated into a single file; larger blocks
+     get their own file. Each file is scanned by run_snippet_hash.sh.
   4. If snippet_match.json reports RECIPROCAL or WEAK_RECIPROCAL matches,
      re-prompt the gateway to rewrite the code without those matches.
   5. Repeat until clean or MIM_MAX_RETRIES exhausted (default 6).
@@ -51,7 +49,6 @@ MAX_RETRIES = int(os.environ.get("MIM_MAX_RETRIES", "6"))
 LICENSE_DETAILS = os.environ.get("MIM_LICENSE_DETAILS", "").lower() in ("1", "true", "yes", "on")
 
 SMALL_SNIPPET_LIMIT = 300
-LARGE_SNIPPET_LIMIT = 50000
 #TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # for test purposes, trigger all categories
 TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -249,36 +246,17 @@ def extract_code_blocks(text: str) -> list:
     return [m.group(1) for m in FENCE_RE.finditer(text)]
 
 
-def split_oversize(content: str, limit: int) -> list:
-    """Split `content` into chunks no larger than `limit`, cutting at line
-    boundaries when possible."""
-    if len(content) <= limit:
-        return [content]
-    chunks = []
-    remaining = content
-    while len(remaining) > limit:
-        cut = remaining.rfind("\n", 0, limit)
-        if cut <= 0:
-            cut = limit
-        chunks.append(remaining[:cut])
-        remaining = remaining[cut:].lstrip("\n")
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
 def group_snippets(blocks: list) -> list:
-    """Blocks 300-50000 chars scan individually; smaller blocks merge into
-    one file; blocks over 50000 chars are split at line boundaries."""
+    """Large blocks scan individually; small blocks (< 300 chars) merge into one."""
     kept = [b for b in blocks if b]
     files, small = [], []
     for b in kept:
         if len(b) >= SMALL_SNIPPET_LIMIT:
-            files.extend(split_oversize(b, LARGE_SNIPPET_LIMIT))
+            files.append(b)
         else:
             small.append(b)
     if small:
-        files.extend(split_oversize("\n\n".join(small), LARGE_SNIPPET_LIMIT))
+        files.append("\n\n".join(small))
     return files
 
 
@@ -300,7 +278,65 @@ def scan_file(content: str) -> dict:
             raise RuntimeError(
                 f"snippet_match.json not produced (exit={result.returncode}): {result.stderr[-500:]}"
             )
-        return json.loads(out_json.read_text())
+
+        http_status = None
+        status_file = td_path / "snippet_status.txt"
+        if status_file.exists():
+            try:
+                http_status = int(status_file.read_text().strip())
+            except ValueError:
+                http_status = None
+
+        raw = out_json.read_text()
+        if not raw.strip():
+            raise RuntimeError(
+                f"snippet_match.json is empty (HTTP {http_status}, exit={result.returncode}): "
+                f"{result.stderr[-500:]}"
+            )
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"snippet_match.json is not valid JSON (HTTP {http_status}): {e}; "
+                f"head={raw[:200]!r}"
+            )
+        if isinstance(parsed, dict):
+            parsed.setdefault("_http_status", http_status)
+        return parsed
+
+
+def scan_error_message(result) -> str:
+    """Return a short error string if the snippet-match JSON reports a failure,
+    else ''. Includes the upstream HTTP status code (when run_snippet_hash.sh
+    captured one) plus Black Duck's `errorMessage`/`errors[]` body, and flags
+    responses that look successful but lack `snippetMatches`."""
+    if not isinstance(result, dict):
+        return f"unexpected response shape: {type(result).__name__}"
+
+    status = result.get("_http_status")
+    status_prefix = f"HTTP {status}" if isinstance(status, int) else ""
+    http_failed = isinstance(status, int) and status >= 400
+
+    body_msg = ""
+    msg = result.get("errorMessage") or result.get("message")
+    code = result.get("errorCode") or result.get("statusCode")
+    if msg:
+        body_msg = f"[{code or '?'}] {msg}"
+    else:
+        errs = result.get("errors")
+        if isinstance(errs, list) and errs:
+            first = errs[0] if isinstance(errs[0], dict) else {}
+            m = first.get("errorMessage") or first.get("message") or str(errs[0])
+            c = first.get("errorCode") or "?"
+            body_msg = f"[{c}] {m}"
+
+    if body_msg:
+        return f"{status_prefix} {body_msg}".strip()
+    if http_failed:
+        return f"{status_prefix}: no error body"
+    if "snippetMatches" not in result:
+        return f"{status_prefix} response missing 'snippetMatches' key".strip()
+    return ""
 
 
 def _first(lst):
@@ -421,19 +457,41 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
         )
         try:
             scan_results = []
+            scan_errors: list = []
             for i, content in enumerate(files):
                 log.debug(
                     "[%s] scan input %d (%d bytes):\n%s",
                     trace.id, i, len(content), content,
                 )
                 st = time.monotonic()
-                scan_results.append(scan_file(content))
-                trace.event(
-                    "scan_ok",
-                    idx=i,
-                    bytes=len(content),
-                    ms=int((time.monotonic() - st) * 1000),
-                )
+                scan_result = scan_file(content)
+                scan_results.append(scan_result)
+                elapsed = int((time.monotonic() - st) * 1000)
+                http_status = scan_result.get("_http_status") if isinstance(scan_result, dict) else None
+                err = scan_error_message(scan_result)
+                if err:
+                    scan_errors.append({
+                        "idx": i,
+                        "bytes": len(content),
+                        "http_status": http_status,
+                        "error": err,
+                    })
+                    trace.event(
+                        "scan_result_error",
+                        idx=i,
+                        bytes=len(content),
+                        ms=elapsed,
+                        http_status=http_status,
+                        err=err[:200],
+                    )
+                else:
+                    trace.event(
+                        "scan_ok",
+                        idx=i,
+                        bytes=len(content),
+                        ms=elapsed,
+                        http_status=http_status,
+                    )
         except Exception as e:
             trace.event("scan_error", err=str(e)[:200])
             trace.finish("scan_error")
@@ -444,13 +502,27 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
                 "trace_id": trace.id,
             }, 500
 
+        if scan_errors and len(scan_errors) == len(files):
+            trace.event("scan_all_failed", count=len(scan_errors))
+            trace.finish("scan_error")
+            return {
+                "error": "all snippet-match scans returned errors",
+                "response": response_text,
+                "history": history,
+                "scan_errors": scan_errors,
+                "trace_id": trace.id,
+            }, 502
+
         hits = find_reciprocal_matches(scan_results)
-        history.append({
+        history_entry = {
             "attempt": attempt + 1,
             "code_blocks": len(blocks),
             "files_scanned": len(files),
             "hits": len(hits),
-        })
+        }
+        if scan_errors:
+            history_entry["scan_errors"] = scan_errors
+        history.append(history_entry)
 
         if hits:
             unique = sorted({(h["category"], h["project"], h["license"]) for h in hits})
