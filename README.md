@@ -100,7 +100,7 @@ The proxy exposes three shapes of endpoint:
 | Route | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible entry point. If the request carries a user message, the assistant text is scanned and possibly rewritten before being returned. If it only has system/tool messages, or the last user content is empty, the whole request is forwarded upstream unchanged. |
-| `POST /v1/messages` | Anthropic Messages API — used by Claude Code and other Anthropic-native clients. Same scan/rewrite behavior as `/v1/chat/completions`, but the response is wrapped in Anthropic shape (`{id: "msg_...", type: "message", content: [{type:"text", text:...}], stop_reason: "end_turn", ...}`). Tool-result follow-ups (last user message contains only `tool_result` blocks) are forwarded upstream unchanged. |
+| `POST /v1/messages` | Anthropic Messages API — used by Claude Code and other Anthropic-native clients. Same scan/rewrite behavior as `/v1/chat/completions`, but the response is wrapped in Anthropic shape (`{id: "msg_...", type: "message", content: [{type:"text", text:...}], stop_reason: "end_turn", ...}`). When the request carries `"stream": true`, the pipeline still runs to completion and the finished assistant text is re-emitted as an Anthropic-shape SSE stream (`message_start` → `content_block_start` → `content_block_delta` chunks → `content_block_stop` → `message_delta` → `message_stop`) so clients that require `text/event-stream` — Claude Code included — accept the reply on the first try. Tool-result follow-ups (last user message contains only `tool_result` blocks) are forwarded upstream unchanged. |
 | Any other path/method | Transparent reverse proxy to the upstream gateway. Handles `GET /v1/models`, session init, embeddings, tool-only chat completions, etc. Client `Authorization` is forwarded; if the client didn't send one, the proxy substitutes `BLACKDUCK_MCP_GATEWAY_KEY`. |
 | `POST /proxy` | Simple test entry — same scan pipeline as `/v1/chat/completions`, but takes `{"prompt": "..."}` (with optional text attachments — see below). Kept for direct CLI use. |
 
@@ -210,13 +210,19 @@ Response fields:
    If the model returns raw code without fences (e.g., Claude Opus 4.7), the
    whole response is scanned instead and a `no_fences_using_whole_response`
    trace event is emitted.
-3. Snippet size is measured in non-whitespace characters. Blocks with
-   ≥ 300 non-whitespace chars are scanned individually; smaller blocks are
-   concatenated together and scanned as a single file — but only if the
-   merged blob itself reaches the 300 non-whitespace-char threshold,
-   otherwise it's dropped (too small to yield useful matches). Each file
-   is written to a fresh tempdir and `run_snippet_hash.sh` is invoked
-   there (so the repo's `snippet_match.json` isn't clobbered).
+3. Snippet size is measured in non-whitespace characters:
+   - Blocks with ≥ 300 non-whitespace chars are scanned individually.
+   - Blocks with > 50000 non-whitespace chars are split at line boundaries
+     into segments each within the cap so every request stays under the
+     snippet-matching endpoint's limit.
+   - Smaller blocks are concatenated together and scanned as a single
+     file — but only if the merged blob itself reaches the 300
+     non-whitespace-char threshold, otherwise it's dropped (too small to
+     yield useful matches).
+
+   Each resulting file is written to a fresh tempdir and
+   `run_snippet_hash.sh` is invoked there (so the repo's
+   `snippet_match.json` isn't clobbered).
 4. `find_reciprocal_matches` walks `snippetMatches.RECIPROCAL` and
    `snippetMatches.WEAK_RECIPROCAL` and flattens hits.
 5. If any hit is found, `build_rewrite_prompt` prepends the match list plus a
@@ -224,10 +230,22 @@ Response fields:
    loop iterates. After `MIM_MAX_RETRIES` failed rewrites the proxy returns
    `clean: false` with a message telling the caller to try a different prompt.
 
-With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`), each match line
-in the rewrite prompt is followed by indented rows carrying `spdx`, ownership,
-the matched file path, and the source/matched line ranges pulled from
-`snippet_match.json`. Example:
+With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`):
+
+- The proxy logs every unique license identified by the snippet match on its
+  own line (one per `(category, license)`), so you can see what triggered a
+  rewrite without pulling the full trace. Example log output:
+
+  ```
+  12:03:45 INFO  [28465c0e] hits count=3 unique=2 sample=['RECIPROCAL:openssl','WEAK_RECIPROCAL:mpl-project']
+  12:03:45 INFO  [28465c0e] licenses count=2
+  12:03:45 INFO  [28465c0e]   [RECIPROCAL] GNU General Public License v3.0 or later (SPDX: GPL-3.0-or-later, ownership: OPEN_SOURCE) <- openssl 1.0.1g
+  12:03:45 INFO  [28465c0e]   [WEAK_RECIPROCAL] Mozilla Public License 2.0 (SPDX: MPL-2.0, ownership: OPEN_SOURCE) <- mpl-project 1.2
+  ```
+
+- Each match line in the rewrite prompt sent back to the LLM is followed by
+  indented rows carrying `spdx`, ownership, the matched file path, and the
+  source/matched line ranges pulled from `snippet_match.json`. Example:
 
 ```
   - [RECIPROCAL] 4MLinux 1.0.1g -> GNU General Public License v3.0 or later
@@ -253,20 +271,30 @@ doing.
 - `info` (default) — one line per pipeline event
 - `debug` — adds the underlying HTTP request logs from `urllib3`
 
-Every request gets a short hex trace id used as a prefix on log lines and
-returned in the JSON response as `trace_id`, so you can correlate output
-across streams.
+Every log line starts with a **side tag** identifying which leg of the
+pipeline the line describes:
+
+| Tag | Meaning |
+|---|---|
+| `[CLIENT ]` | proxy ↔ the caller (a coding agent, `curl`, etc.) |
+| `[SERVER ]` | proxy ↔ the upstream LLM gateway |
+| `[SCANNER]` | proxy ↔ the Black Duck snippet-matching endpoint |
+
+Every request also gets a short hex trace id used as a second prefix on log
+lines and returned in the JSON response as `trace_id`, so you can correlate
+output across streams.
 
 Example info-level output for a clean request:
 
 ```
-11:01:23 INFO  [28465c0e] request prompt_chars=45
-11:01:23 INFO  [28465c0e] attempt_start n=1 prompt_chars=45
-11:01:30 INFO  [28465c0e] upstream_ok ms=6905 resp_chars=1963
-11:01:30 INFO  [28465c0e] code_blocks found=1 files=1 sizes=[1058]
-11:01:31 INFO  [28465c0e] scan_ok idx=0 bytes=1058 ms=1610
-11:01:31 INFO  [28465c0e] clean
-11:01:31 INFO  [28465c0e] done outcome=clean
+11:01:23 INFO  [CLIENT ] [28465c0e] request prompt_chars=45
+11:01:23 INFO  [SERVER ] [28465c0e] attempt_start n=1 prompt_chars=45
+11:01:30 INFO  [SERVER ] [28465c0e] upstream_ok ms=6905 resp_chars=1963
+11:01:30 INFO  [SCANNER] [28465c0e] code_blocks found=1 files=1 sizes=[1058]
+11:01:30 INFO  [SCANNER] [28465c0e] scan_start idx=0 bytes=1058
+11:01:31 INFO  [SCANNER] [28465c0e] scan_ok idx=0 bytes=1058 ms=1610 http_status=200
+11:01:31 INFO  [SCANNER] [28465c0e] clean
+11:01:31 INFO  [CLIENT ] [28465c0e] done outcome=clean
 ```
 
 Emitted event kinds:
@@ -280,9 +308,13 @@ Emitted event kinds:
 | `no_fences_using_whole_response` | assistant returned raw code without fences; whole response is scanned | `chars` |
 | `empty_response` | assistant returned an empty message | — |
 | `code_blocks` | after extraction/grouping | `found`, `files`, `sizes` |
-| `scan_ok` | one file scanned by `run_snippet_hash.sh` | `idx`, `bytes`, `ms` |
-| `scan_error` | scan failed | `err` |
+| `scan_start` | about to invoke `run_snippet_hash.sh` for one file | `idx`, `bytes` |
+| `scan_ok` | one file scanned successfully | `idx`, `bytes`, `ms`, `http_status` |
+| `scan_result_error` | scan returned a body indicating failure | `idx`, `bytes`, `ms`, `http_status`, `err` |
+| `scan_error` | scan couldn't be executed at all | `err` |
+| `scan_all_failed` | every file's scan failed in this attempt | `count` |
 | `hits` | reciprocal matches found | `count`, `unique`, `sample` |
+| `licenses` | with `-L`, followed by one log line per unique license identified | `count` |
 | `clean` | no matches | — |
 | `rewrite_prompt` | re-prompt is about to be sent | — |
 | `done` | terminal state for the request | `outcome` |

@@ -7,9 +7,11 @@ Flow per request:
   2. Extract fenced code blocks from the response; if none are present
      (e.g., Claude Opus emits raw code), fall back to the whole response.
   3. Snippets with < 300 non-whitespace chars are concatenated into a
-     single file; larger blocks get their own file. If the concatenated
-     small file is itself still below the threshold, it is dropped
-     (too small to yield useful matches). Each file is scanned by
+     single file; larger blocks get their own file; blocks whose
+     non-whitespace length exceeds 50000 are split at line boundaries
+     into segments each within the cap. If the concatenated small file
+     is itself still below the 300 threshold, it is dropped (too small
+     to yield useful matches). Each file is scanned by
      run_snippet_hash.sh.
   4. If snippet_match.json reports RECIPROCAL or WEAK_RECIPROCAL matches,
      re-prompt the gateway to rewrite the code without those matches.
@@ -40,7 +42,7 @@ from collections import deque
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 APP_DIR = Path(__file__).resolve().parent
 SCRIPT = APP_DIR / "run_snippet_hash.sh"
@@ -52,6 +54,7 @@ MAX_RETRIES = int(os.environ.get("MIM_MAX_RETRIES", "6"))
 LICENSE_DETAILS = os.environ.get("MIM_LICENSE_DETAILS", "").lower() in ("1", "true", "yes", "on")
 
 SMALL_SNIPPET_LIMIT = 300
+LARGE_SNIPPET_LIMIT = 50000
 #TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # for test purposes, trigger all categories
 TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -78,6 +81,13 @@ if LOG_LEVEL_NAME == "off":
 
 TRACES: "deque[dict]" = deque(maxlen=TRACE_KEEP)
 
+# Tags identifying which leg of the pipeline a log line belongs to. All tags
+# are the same width so the columns line up when tailing the log.
+SIDE_CLIENT = "CLIENT "   # proxy <-> the coding agent (or curl) that called us
+SIDE_SERVER = "SERVER "   # proxy <-> the upstream LLM gateway
+SIDE_SCANNER = "SCANNER"  # proxy <-> the Black Duck snippet-matching endpoint
+SIDE_NONE = "       "     # untagged lines (framework/startup output)
+
 
 class Trace:
     """Per-request breadcrumbs: emits log lines and captures a record for /traces."""
@@ -89,22 +99,23 @@ class Trace:
         self.events: list = []
         self.outcome: str = "pending"
 
-    def event(self, kind: str, **fields) -> None:
+    def event(self, kind: str, side: str = SIDE_NONE, **fields) -> None:
         entry = {
             "kind": kind,
+            "side": side.strip(),
             "t_ms": int((time.monotonic() - self.t0) * 1000),
             **fields,
         }
         self.events.append(entry)
         if fields:
             parts = " ".join(f"{k}={_fmt(v)}" for k, v in fields.items())
-            log.info("[%s] %s %s", self.id, kind, parts)
+            log.info("[%s] [%s] %s %s", side, self.id, kind, parts)
         else:
-            log.info("[%s] %s", self.id, kind)
+            log.info("[%s] [%s] %s", side, self.id, kind)
 
     def finish(self, outcome: str) -> None:
         self.outcome = outcome
-        self.event("done", outcome=outcome)
+        self.event("done", side=SIDE_CLIENT, outcome=outcome)
         TRACES.append({
             "trace_id": self.id,
             "prompt_preview": self.prompt_preview,
@@ -254,22 +265,59 @@ def _non_ws_len(s: str) -> int:
     return sum(1 for c in s if not c.isspace())
 
 
+def _split_by_nonws(content: str, max_nonws: int) -> list:
+    """Split `content` into segments each with <= max_nonws non-whitespace
+    chars, preferring line boundaries. If a single line already exceeds the
+    limit (e.g. minified code), hard-split it at the first char that pushes
+    the running non-whitespace count over the ceiling."""
+    if _non_ws_len(content) <= max_nonws:
+        return [content]
+    segments = []
+    buf = []
+    buf_nonws = 0
+    for line in content.splitlines(keepends=True):
+        ln = _non_ws_len(line)
+        if buf and buf_nonws + ln > max_nonws:
+            segments.append("".join(buf))
+            buf = []
+            buf_nonws = 0
+        while ln > max_nonws:
+            cut_end = 0
+            count = 0
+            for i, ch in enumerate(line):
+                cut_end = i + 1
+                if not ch.isspace():
+                    count += 1
+                    if count == max_nonws:
+                        break
+            segments.append(line[:cut_end])
+            line = line[cut_end:]
+            ln = _non_ws_len(line)
+        buf.append(line)
+        buf_nonws += ln
+    if buf:
+        segments.append("".join(buf))
+    return segments
+
+
 def group_snippets(blocks: list) -> list:
     """A snippet must have at least SMALL_SNIPPET_LIMIT non-whitespace chars
     to be worth scanning. Blocks that meet the threshold scan individually;
     smaller blocks are merged and only sent if their combined non-whitespace
-    length reaches the threshold."""
+    length reaches the threshold. Blocks whose non-whitespace length exceeds
+    LARGE_SNIPPET_LIMIT are split at line boundaries into segments each
+    within the cap."""
     kept = [b for b in blocks if b]
     files, small = [], []
     for b in kept:
         if _non_ws_len(b) >= SMALL_SNIPPET_LIMIT:
-            files.append(b)
+            files.extend(_split_by_nonws(b, LARGE_SNIPPET_LIMIT))
         else:
             small.append(b)
     if small:
         merged = "\n\n".join(small)
         if _non_ws_len(merged) >= SMALL_SNIPPET_LIMIT:
-            files.append(merged)
+            files.extend(_split_by_nonws(merged, LARGE_SNIPPET_LIMIT))
     return files
 
 
@@ -380,6 +428,28 @@ def find_reciprocal_matches(scan_results: list) -> list:
     return hits
 
 
+def _license_hit_lines(hits: list) -> list:
+    """One human-readable line per unique license identified across `hits`.
+    Grouped by (category, SPDX id or license name) so the same license from
+    several projects collapses into one entry."""
+    seen = {}
+    for h in hits:
+        key = (h["category"], h.get("spdx") or "", h.get("license") or "")
+        seen.setdefault(key, h)
+    lines = []
+    for h in sorted(seen.values(), key=lambda x: (x["category"], x.get("license") or "")):
+        parts = [f"[{h['category']}]", h.get("license") or "?"]
+        spdx = h.get("spdx")
+        own = h.get("ownership")
+        if spdx or own:
+            parts.append(f"(SPDX: {spdx or '-'}, ownership: {own or '-'})")
+        proj = h.get("project")
+        if proj:
+            parts.append(f"<- {proj} {h.get('version') or ''}".rstrip())
+        lines.append(" ".join(parts))
+    return lines
+
+
 def _format_hit(h: dict, detailed: bool) -> str:
     header = f"  - [{h['category']}] {h['project']} {h['version']} -> {h['license']}"
     if not detailed:
@@ -422,23 +492,24 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
     note, trace_id, error) — the caller shapes them for its own protocol.
     """
     trace = Trace(prompt)
-    trace.event("request", prompt_chars=len(prompt), **(request_fields or {}))
-    log.debug("[%s] initial prompt:\n%s", trace.id, _prompt_debug_view(prompt))
+    trace.event("request", side=SIDE_CLIENT, prompt_chars=len(prompt), **(request_fields or {}))
+    log.debug("[%s] [%s] initial prompt:\n%s", SIDE_CLIENT, trace.id, _prompt_debug_view(prompt))
     current_prompt = prompt
     history: list = []
 
     for attempt in range(MAX_RETRIES + 1):
-        trace.event("attempt_start", n=attempt + 1, prompt_chars=len(current_prompt))
-        log.debug("[%s] attempt %d prompt:\n%s", trace.id, attempt + 1, _prompt_debug_view(current_prompt))
+        trace.event("attempt_start", side=SIDE_SERVER, n=attempt + 1, prompt_chars=len(current_prompt))
+        log.debug("[%s] [%s] attempt %d prompt:\n%s", SIDE_SERVER, trace.id, attempt + 1, _prompt_debug_view(current_prompt))
         t = time.monotonic()
         try:
             response_text = forward_to_gateway(current_prompt)
         except Exception as e:
-            trace.event("gateway_error", err=str(e)[:200])
+            trace.event("gateway_error", side=SIDE_SERVER, err=str(e)[:200])
             trace.finish("gateway_error")
             return {"error": f"gateway request failed: {e}", "trace_id": trace.id}, 502
         trace.event(
             "upstream_ok",
+            side=SIDE_SERVER,
             ms=int((time.monotonic() - t) * 1000),
             resp_chars=len(response_text),
         )
@@ -449,7 +520,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             blocks = [response_text]
             source = "whole_response"
         if not blocks:
-            trace.event("empty_response")
+            trace.event("empty_response", side=SIDE_SERVER)
             trace.finish("no_code")
             return {
                 "response": response_text,
@@ -461,9 +532,10 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
 
         files = group_snippets(blocks)
         if source == "whole_response":
-            trace.event("no_fences_using_whole_response", chars=len(response_text))
+            trace.event("no_fences_using_whole_response", side=SIDE_SERVER, chars=len(response_text))
         trace.event(
             "code_blocks",
+            side=SIDE_SCANNER,
             found=len(blocks),
             files=len(files),
             sizes=[len(f) for f in files],
@@ -473,9 +545,10 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             scan_errors: list = []
             for i, content in enumerate(files):
                 log.debug(
-                    "[%s] scan input %d (%d bytes):\n%s",
-                    trace.id, i, len(content), content,
+                    "[%s] [%s] scan input %d (%d bytes):\n%s",
+                    SIDE_SCANNER, trace.id, i, len(content), content,
                 )
+                trace.event("scan_start", side=SIDE_SCANNER, idx=i, bytes=len(content))
                 st = time.monotonic()
                 scan_result = scan_file(content)
                 scan_results.append(scan_result)
@@ -491,6 +564,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
                     })
                     trace.event(
                         "scan_result_error",
+                        side=SIDE_SCANNER,
                         idx=i,
                         bytes=len(content),
                         ms=elapsed,
@@ -500,13 +574,14 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
                 else:
                     trace.event(
                         "scan_ok",
+                        side=SIDE_SCANNER,
                         idx=i,
                         bytes=len(content),
                         ms=elapsed,
                         http_status=http_status,
                     )
         except Exception as e:
-            trace.event("scan_error", err=str(e)[:200])
+            trace.event("scan_error", side=SIDE_SCANNER, err=str(e)[:200])
             trace.finish("scan_error")
             return {
                 "error": f"snippet scan failed: {e}",
@@ -516,7 +591,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             }, 500
 
         if scan_errors and len(scan_errors) == len(files):
-            trace.event("scan_all_failed", count=len(scan_errors))
+            trace.event("scan_all_failed", side=SIDE_SCANNER, count=len(scan_errors))
             trace.finish("scan_error")
             return {
                 "error": "all snippet-match scans returned errors",
@@ -541,12 +616,18 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             unique = sorted({(h["category"], h["project"], h["license"]) for h in hits})
             trace.event(
                 "hits",
+                side=SIDE_SCANNER,
                 count=len(hits),
                 unique=len(unique),
                 sample=[f"{c}:{p}" for c, p, _ in unique[:3]],
             )
+            if LICENSE_DETAILS:
+                license_lines = _license_hit_lines(hits)
+                trace.event("licenses", side=SIDE_SCANNER, count=len(license_lines))
+                for line in license_lines:
+                    log.info("[%s] [%s]   %s", SIDE_SCANNER, trace.id, line)
         else:
-            trace.event("clean")
+            trace.event("clean", side=SIDE_SCANNER)
 
         if not hits:
             trace.finish("clean")
@@ -574,9 +655,9 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
                 ),
             }, 200
 
-        trace.event("rewrite_prompt")
+        trace.event("rewrite_prompt", side=SIDE_SERVER)
         current_prompt = build_rewrite_prompt(prompt, response_text, hits, detailed=LICENSE_DETAILS)
-        log.debug("[%s] rewrite prompt:\n%s", trace.id, _prompt_debug_view(current_prompt))
+        log.debug("[%s] [%s] rewrite prompt:\n%s", SIDE_SERVER, trace.id, _prompt_debug_view(current_prompt))
 
     trace.finish("unreachable")
     return {"error": "unreachable", "trace_id": trace.id}, 500
@@ -609,11 +690,11 @@ def _passthrough(subpath: str):
             allow_redirects=False,
         )
     except Exception as e:
-        log.warning("passthrough %s %s failed: %s", request.method, subpath, e)
+        log.warning("[%s] passthrough %s %s failed: %s", SIDE_SERVER, request.method, subpath, e)
         return jsonify({"error": f"upstream passthrough failed: {e}"}), 502
     resp_headers = [(k, v) for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP]
-    log.info("passthrough %s /%s -> %d (%d bytes)",
-             request.method, subpath, upstream.status_code, len(upstream.content))
+    log.info("[%s] passthrough %s /%s -> %d (%d bytes)",
+             SIDE_SERVER, request.method, subpath, upstream.status_code, len(upstream.content))
     return upstream.content, upstream.status_code, resp_headers
 
 
@@ -659,6 +740,72 @@ def _anthropic_response(text: str, model_name: str, trace_id: str) -> dict:
     }
 
 
+def _sse_frame(event_name: str, data: dict) -> str:
+    """One SSE frame: `event: <name>\\ndata: <json>\\n\\n`."""
+    return f"event: {event_name}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+ANTHROPIC_SSE_CHUNK_CHARS = 256
+
+
+def _anthropic_sse_stream(text: str, model_name: str, trace_id: str):
+    """Generate the Anthropic Messages SSE frame sequence for an
+    already-computed assistant text response. The pipeline has already run
+    and buffered the reply, so we can't stream tokens as the model produces
+    them — but chunking the finished text into `content_block_delta` events
+    lets the client's SSE parser consume it exactly as it would a real
+    live stream (message_start → content_block_start → deltas →
+    content_block_stop → message_delta → message_stop)."""
+    msg_id = f"msg_{trace_id}" if trace_id else "msg_"
+    yield _sse_frame("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model_name,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+    yield _sse_frame("content_block_start", {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    })
+    if text:
+        for i in range(0, len(text), ANTHROPIC_SSE_CHUNK_CHARS):
+            yield _sse_frame("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text[i:i + ANTHROPIC_SSE_CHUNK_CHARS],
+                },
+            })
+    yield _sse_frame("content_block_stop", {
+        "type": "content_block_stop",
+        "index": 0,
+    })
+    yield _sse_frame("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": max(1, len(text) // 4)},
+    })
+    yield _sse_frame("message_stop", {"type": "message_stop"})
+
+
+def _anthropic_sse_error(err_type: str, message: str, trace_id: str = ""):
+    """Single-frame SSE error stream matching Anthropic's error event shape."""
+    yield _sse_frame("error", {
+        "type": "error",
+        "error": {"type": err_type, "message": message},
+        "trace_id": trace_id,
+    })
+
+
 @app.route("/proxy", methods=["POST"])
 def proxy():
     ctype = (request.content_type or "").split(";", 1)[0].strip().lower()
@@ -695,7 +842,7 @@ def chat_completions():
     user_msgs = [m for m in messages if m.get("role") == "user"]
     prompt = _extract_user_text(user_msgs[-1]).strip() if user_msgs else ""
     if not prompt:
-        log.info("chat_completions passthrough (no user prompt)")
+        log.info("[%s] chat_completions passthrough (no user prompt)", SIDE_CLIENT)
         return _passthrough("v1/chat/completions")
 
     request_fields = {
@@ -718,8 +865,15 @@ def chat_completions():
 
 @app.route("/v1/messages", methods=["POST"])
 def anthropic_messages():
-    """Anthropic Messages API entry — used by Claude Code and other clients."""
+    """Anthropic Messages API entry — used by Claude Code and other clients.
+
+    Honors the client's `stream` flag: when true, we still run the pipeline
+    to completion (so scan/rewrite still happen) and then re-emit the final
+    text as an Anthropic-shape SSE stream. Without this, Claude Code asks
+    for `text/event-stream`, gets JSON, and retries — showing up in the
+    logs as the same 244-char request being sent twice."""
     body = request.get_json(silent=True) or {}
+    stream = bool(body.get("stream"))
     messages = body.get("messages") or []
     user_msgs = [m for m in messages if m.get("role") == "user"]
     # Anthropic user messages can carry tool_result content (no `type:"text"`
@@ -727,26 +881,39 @@ def anthropic_messages():
     # and we fall through to passthrough.
     prompt = _extract_user_text(user_msgs[-1]).strip() if user_msgs else ""
     if not prompt:
-        log.info("anthropic_messages passthrough (no user text)")
+        log.info("[%s] anthropic_messages passthrough (no user text)", SIDE_CLIENT)
         return _passthrough("v1/messages")
 
     request_fields = {
         "channel": "anthropic_messages",
         "msg_count": len(messages),
         "user_msgs": len(user_msgs),
+        "stream": stream,
     }
     result, status = run_pipeline(prompt, request_fields=request_fields)
+    model_name = body.get("model") or MODEL
+    trace_id = result.get("trace_id", "")
+
     if "error" in result:
+        if stream:
+            return Response(
+                _anthropic_sse_error("proxy_error", result["error"], trace_id),
+                status=status,
+                mimetype="text/event-stream",
+            )
         return jsonify({
             "type": "error",
             "error": {"type": "proxy_error", "message": result["error"]},
-            "trace_id": result.get("trace_id"),
+            "trace_id": trace_id,
         }), status
-    return jsonify(_anthropic_response(
-        result["response"],
-        body.get("model") or MODEL,
-        result.get("trace_id", ""),
-    )), status
+
+    if stream:
+        return Response(
+            _anthropic_sse_stream(result["response"], model_name, trace_id),
+            status=status,
+            mimetype="text/event-stream",
+        )
+    return jsonify(_anthropic_response(result["response"], model_name, trace_id)), status
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
