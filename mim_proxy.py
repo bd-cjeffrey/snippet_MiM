@@ -227,7 +227,43 @@ def inline_attachments(prompt: str, attachments: list) -> str:
     return "\n".join(chunks).rstrip() + "\n"
 
 
-def forward_to_gateway(prompt: str) -> str:
+# The upstream LiteLLM gateway validates request bodies with a Pydantic model
+# and returns `Extra inputs are not permitted` for any field outside its schema.
+# Newer Claude Code releases send fields (e.g. `output_config`) the gateway's
+# `/v1/messages` schema doesn't accept, so we whitelist what we forward.
+ANTHROPIC_ALLOWED_FIELDS = frozenset({
+    "model", "messages", "system", "max_tokens", "tools", "tool_choice",
+    "temperature", "top_p", "top_k", "stop_sequences", "metadata", "stream",
+})
+
+OPENAI_ALLOWED_FIELDS = frozenset({
+    "model", "messages", "temperature", "top_p", "n", "stream", "stop",
+    "max_tokens", "max_completion_tokens", "presence_penalty",
+    "frequency_penalty", "logit_bias", "user", "response_format", "seed",
+    "tools", "tool_choice", "parallel_tool_calls", "logprobs", "top_logprobs",
+    "reasoning_effort", "service_tier",
+})
+
+
+def _sanitize_upstream_body(body: dict, channel: str) -> tuple:
+    """Drop fields the upstream gateway doesn't accept. Returns
+    (kept_body, dropped_keys)."""
+    allowed = ANTHROPIC_ALLOWED_FIELDS if channel == "anthropic" else OPENAI_ALLOWED_FIELDS
+    kept, dropped = {}, []
+    for k, v in body.items():
+        if k in allowed:
+            kept[k] = v
+        else:
+            dropped.append(k)
+    return kept, sorted(dropped)
+
+
+def forward_to_gateway(body: dict, endpoint: str) -> dict:
+    """Forward the client's request body verbatim to `endpoint` on the
+    upstream gateway (e.g. "/v1/messages" or "/v1/chat/completions") and
+    return the parsed response JSON. Streaming to the upstream is always
+    disabled — we need the full body buffered so we can scan it; if the
+    downstream client asked for SSE we re-emit our own stream after."""
     if not GATEWAY_URL:
         raise RuntimeError("BLACKDUCK_MCP_GATEWAY_URL is not set")
     if not GATEWAY_KEY:
@@ -236,12 +272,13 @@ def forward_to_gateway(prompt: str) -> str:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {GATEWAY_KEY}",
     }
-    payload = {
-        "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-    }
+    channel = "anthropic" if endpoint.endswith("/messages") else "openai"
+    payload, dropped = _sanitize_upstream_body({**body, "stream": False}, channel)
+    if dropped:
+        log.info("[%s] dropped %d field(s) not in %s upstream schema: %s",
+                 SIDE_SERVER, len(dropped), channel, dropped)
     resp = requests.post(
-        f"{GATEWAY_URL}/v1/chat/completions",
+        f"{GATEWAY_URL}{endpoint}",
         json=payload,
         headers=headers,
         timeout=120,
@@ -249,11 +286,38 @@ def forward_to_gateway(prompt: str) -> str:
     )
     if resp.status_code >= 400:
         raise RuntimeError(f"gateway {resp.status_code}: {resp.text[:400]}")
-    data = resp.json()
-    content = data["choices"][0]["message"]["content"]
-    # Some models return literal "\n" (backslash-n) rather than real newlines;
-    # normalize so the fence regex and downstream scan see actual line breaks.
-    return content.replace("\\n", "\n")
+    return resp.json()
+
+
+def _extract_response_text(response_body: dict, channel: str) -> str:
+    """Concatenate every text block from a completion response for the
+    snippet scanner. Non-text blocks (tool_use, etc.) are intentionally
+    ignored — they pass through the pipeline untouched. The `\\n` fix-up
+    matches the prior behaviour: some models emit backslash-n instead of
+    a real newline, which breaks the fence regex."""
+    if channel == "anthropic":
+        parts = []
+        for b in response_body.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text") or "")
+        return "\n".join(parts).replace("\\n", "\n")
+    if channel == "openai":
+        try:
+            content = response_body["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            content = ""
+        return content.replace("\\n", "\n")
+    return ""
+
+
+def _last_user_text(body: dict) -> str:
+    """Text of the most recent user turn — used only for the trace preview
+    and debug logging. Never fed back to the upstream (we forward the whole
+    body verbatim)."""
+    for m in reversed(body.get("messages") or []):
+        if m.get("role") == "user":
+            return _extract_user_text(m).strip()
+    return ""
 
 
 def extract_code_blocks(text: str) -> list:
@@ -468,45 +532,92 @@ def _format_hit(h: dict, detailed: bool) -> str:
     return "\n".join([header] + extras)
 
 
-def build_rewrite_prompt(
-    original_prompt: str,
-    prior_response: str,
-    hits: list,
-    detailed: bool = False,
-) -> str:
+def _rewrite_user_turn(hits: list, detailed: bool) -> str:
+    """Content of the follow-up user message appended to the conversation
+    when the scan finds reciprocal matches. Naming the matched projects /
+    licenses in the message body lets the model actually target them —
+    the previous prompt-rewriting hack computed this list but never sent
+    it upstream."""
     listed = "\n".join(_format_hit(h, detailed) for h in hits[:20])
     return (
-        "Rewrite the all the code returned to me, change the "
-        "algorithm and control flow, significantly change every comment, including banner details, and rename all code identifiers and take a clean-room "
-        "approach, not copying directly from open source. \n\n"
-        f"Original request:\n{original_prompt}\n\n"
-        f"Previous (rejected) response:\n{prior_response}\n"
+        "The previous response contained code that matches reciprocal / "
+        "copyleft licensed source:\n" + listed + "\n\n"
+        "Please rewrite the code with a materially different algorithm and "
+        "control flow, significantly reworded comments (including banner "
+        "text), and renamed identifiers, taking a clean-room approach not "
+        "copied from open source."
     )
 
 
-def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
-    """Run the LLM + scan + rewrite loop for `prompt`.
+def _append_rewrite_turn(body: dict, channel: str, response_body: dict,
+                          hits: list) -> dict:
+    """Build a new request body by appending the assistant's prior response
+    plus a user turn asking for a rewrite. Preserves everything else the
+    client sent (system prompt, tools, model, etc.)."""
+    messages = list(body.get("messages") or [])
+    if channel == "anthropic":
+        messages.append({
+            "role": "assistant",
+            "content": response_body.get("content") or [],
+        })
+    else:  # openai
+        try:
+            assistant_content = response_body["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            assistant_content = ""
+        messages.append({"role": "assistant", "content": assistant_content})
+    messages.append({
+        "role": "user",
+        "content": _rewrite_user_turn(hits, detailed=LICENSE_DETAILS),
+    })
+    return {**body, "messages": messages}
 
-    Returns (result_dict, status_code). Result includes fields expected by
-    the /proxy endpoint (response, attempts, history, clean, hits, message,
-    note, trace_id, error) — the caller shapes them for its own protocol.
+
+def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple:
+    """Run the LLM + scan + rewrite loop against the client's FULL request
+    body — preserving model, system, tools, and the full messages array.
+
+    channel: "anthropic" (upstream /v1/messages) or "openai" (upstream
+    /v1/chat/completions).
+
+    Returns (result, status). Result includes:
+      response_body -- the final upstream response body (dict), preserving
+                       content blocks including tool_use so the handler can
+                       re-emit them verbatim.
+      attempts, history, clean, hits, message, note, trace_id, error --
+                       as before.
     """
-    trace = Trace(prompt)
-    trace.event("request", side=SIDE_CLIENT, prompt_chars=len(prompt), **(request_fields or {}))
-    log.debug("[%s] [%s] initial prompt:\n%s", SIDE_CLIENT, trace.id, _prompt_debug_view(prompt))
-    current_prompt = prompt
+    endpoint = "/v1/messages" if channel == "anthropic" else "/v1/chat/completions"
+    preview = _last_user_text(body)
+    trace = Trace(preview)
+    trace.event("request", side=SIDE_CLIENT, prompt_chars=len(preview), **(request_fields or {}))
+    log.debug("[%s] [%s] initial prompt:\n%s", SIDE_CLIENT, trace.id, _prompt_debug_view(preview))
+    current_body = body
     history: list = []
 
     for attempt in range(MAX_RETRIES + 1):
-        trace.event("attempt_start", side=SIDE_SERVER, n=attempt + 1, prompt_chars=len(current_prompt))
-        log.debug("[%s] [%s] attempt %d prompt:\n%s", SIDE_SERVER, trace.id, attempt + 1, _prompt_debug_view(current_prompt))
+        msgs = current_body.get("messages") or []
+        trace.event(
+            "attempt_start",
+            side=SIDE_SERVER,
+            n=attempt + 1,
+            endpoint=endpoint,
+            model=current_body.get("model"),
+            msg_count=len(msgs),
+        )
+        log.debug(
+            "[%s] [%s] attempt %d body-preview (last user):\n%s",
+            SIDE_SERVER, trace.id, attempt + 1, _prompt_debug_view(_last_user_text(current_body)),
+        )
         t = time.monotonic()
         try:
-            response_text = forward_to_gateway(current_prompt)
+            response_body = forward_to_gateway(current_body, endpoint)
         except Exception as e:
             trace.event("gateway_error", side=SIDE_SERVER, err=str(e)[:200])
             trace.finish("gateway_error")
             return {"error": f"gateway request failed: {e}", "trace_id": trace.id}, 502
+
+        response_text = _extract_response_text(response_body, channel)
         trace.event(
             "upstream_ok",
             side=SIDE_SERVER,
@@ -523,11 +634,11 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             trace.event("empty_response", side=SIDE_SERVER)
             trace.finish("no_code")
             return {
-                "response": response_text,
+                "response_body": response_body,
                 "attempts": attempt + 1,
                 "history": history,
                 "trace_id": trace.id,
-                "note": "response was empty; nothing scanned",
+                "note": "no scannable text in assistant response",
             }, 200
 
         files = group_snippets(blocks)
@@ -585,7 +696,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             trace.finish("scan_error")
             return {
                 "error": f"snippet scan failed: {e}",
-                "response": response_text,
+                "response_body": response_body,
                 "history": history,
                 "trace_id": trace.id,
             }, 500
@@ -595,7 +706,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             trace.finish("scan_error")
             return {
                 "error": "all snippet-match scans returned errors",
-                "response": response_text,
+                "response_body": response_body,
                 "history": history,
                 "scan_errors": scan_errors,
                 "trace_id": trace.id,
@@ -632,7 +743,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
         if not hits:
             trace.finish("clean")
             return {
-                "response": response_text,
+                "response_body": response_body,
                 "attempts": attempt + 1,
                 "history": history,
                 "trace_id": trace.id,
@@ -642,7 +753,7 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
         if attempt >= MAX_RETRIES:
             trace.finish("give_up")
             return {
-                "response": response_text,
+                "response_body": response_body,
                 "attempts": attempt + 1,
                 "history": history,
                 "hits": hits,
@@ -656,8 +767,11 @@ def run_pipeline(prompt: str, request_fields: dict = None) -> tuple:
             }, 200
 
         trace.event("rewrite_prompt", side=SIDE_SERVER)
-        current_prompt = build_rewrite_prompt(prompt, response_text, hits, detailed=LICENSE_DETAILS)
-        log.debug("[%s] [%s] rewrite prompt:\n%s", SIDE_SERVER, trace.id, _prompt_debug_view(current_prompt))
+        current_body = _append_rewrite_turn(current_body, channel, response_body, hits)
+        log.debug(
+            "[%s] [%s] rewrite user turn appended (messages=%d)",
+            SIDE_SERVER, trace.id, len(current_body.get("messages") or []),
+        )
 
     trace.finish("unreachable")
     return {"error": "unreachable", "trace_id": trace.id}, 500
@@ -710,36 +824,6 @@ def _extract_user_text(msg: dict) -> str:
     return ""
 
 
-def _openai_response(text: str, model_name: str, trace_id: str) -> dict:
-    """Wrap `text` in an OpenAI /v1/chat/completions response envelope."""
-    return {
-        "id": f"chatcmpl-{trace_id}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model_name,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
-
-
-def _anthropic_response(text: str, model_name: str, trace_id: str) -> dict:
-    """Wrap `text` in an Anthropic /v1/messages response envelope."""
-    return {
-        "id": f"msg_{trace_id}",
-        "type": "message",
-        "role": "assistant",
-        "model": model_name,
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": {"input_tokens": 0, "output_tokens": 0},
-    }
-
-
 def _sse_frame(event_name: str, data: dict) -> str:
     """One SSE frame: `event: <name>\\ndata: <json>\\n\\n`."""
     return f"event: {event_name}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
@@ -748,15 +832,23 @@ def _sse_frame(event_name: str, data: dict) -> str:
 ANTHROPIC_SSE_CHUNK_CHARS = 256
 
 
-def _anthropic_sse_stream(text: str, model_name: str, trace_id: str):
+def _anthropic_sse_stream(response_body: dict, trace_id: str):
     """Generate the Anthropic Messages SSE frame sequence for an
-    already-computed assistant text response. The pipeline has already run
-    and buffered the reply, so we can't stream tokens as the model produces
-    them — but chunking the finished text into `content_block_delta` events
-    lets the client's SSE parser consume it exactly as it would a real
-    live stream (message_start → content_block_start → deltas →
-    content_block_stop → message_delta → message_stop)."""
-    msg_id = f"msg_{trace_id}" if trace_id else "msg_"
+    already-buffered response body. Preserves every content block the
+    upstream produced — `text` blocks stream as `text_delta`s (chunked so
+    the client's parser sees incremental progress), `tool_use` blocks
+    stream as an `input_json_delta` carrying the tool's input, and any
+    other block type is echoed inside the initial `content_block_start`
+    frame. Without this, tools declared by Claude Code would never fire."""
+    msg_id = response_body.get("id") or (f"msg_{trace_id}" if trace_id else "msg_")
+    model_name = response_body.get("model", "unknown")
+    usage = response_body.get("usage") or {}
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    stop_reason = response_body.get("stop_reason") or "end_turn"
+    stop_sequence = response_body.get("stop_sequence")
+    content = response_body.get("content") or []
+
     yield _sse_frame("message_start", {
         "type": "message_start",
         "message": {
@@ -767,32 +859,72 @@ def _anthropic_sse_stream(text: str, model_name: str, trace_id: str):
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
         },
     })
-    yield _sse_frame("content_block_start", {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    })
-    if text:
-        for i in range(0, len(text), ANTHROPIC_SSE_CHUNK_CHARS):
-            yield _sse_frame("content_block_delta", {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "text_delta",
-                    "text": text[i:i + ANTHROPIC_SSE_CHUNK_CHARS],
+
+    for idx, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text") or ""
+            yield _sse_frame("content_block_start", {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "text", "text": ""},
+            })
+            for i in range(0, len(text), ANTHROPIC_SSE_CHUNK_CHARS):
+                yield _sse_frame("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": text[i:i + ANTHROPIC_SSE_CHUNK_CHARS],
+                    },
+                })
+            yield _sse_frame("content_block_stop", {
+                "type": "content_block_stop",
+                "index": idx,
+            })
+        elif btype == "tool_use":
+            yield _sse_frame("content_block_start", {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": block.get("id") or f"toolu_{idx}",
+                    "name": block.get("name") or "",
+                    "input": {},
                 },
             })
-    yield _sse_frame("content_block_stop", {
-        "type": "content_block_stop",
-        "index": 0,
-    })
+            input_json = json.dumps(block.get("input") or {}, separators=(",", ":"))
+            yield _sse_frame("content_block_delta", {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "input_json_delta", "partial_json": input_json},
+            })
+            yield _sse_frame("content_block_stop", {
+                "type": "content_block_stop",
+                "index": idx,
+            })
+        else:
+            # Unknown block type — echo the whole block in the start frame
+            # so no fields are lost, then stop it immediately.
+            yield _sse_frame("content_block_start", {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": block,
+            })
+            yield _sse_frame("content_block_stop", {
+                "type": "content_block_stop",
+                "index": idx,
+            })
+
     yield _sse_frame("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": max(1, len(text) // 4)},
+        "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+        "usage": {"output_tokens": output_tokens},
     })
     yield _sse_frame("message_stop", {"type": "message_stop"})
 
@@ -823,6 +955,7 @@ def proxy():
         return jsonify({"error": str(e)}), 400
 
     prompt = inline_attachments(raw_prompt, attachments)
+    upstream_body = {"model": MODEL, "messages": [{"role": "user", "content": prompt}]}
     request_fields = {
         "channel": "proxy",
         "total_chars": len(prompt),
@@ -831,7 +964,9 @@ def proxy():
             for a in attachments
         ] if attachments else [],
     }
-    result, status = run_pipeline(prompt, request_fields=request_fields)
+    result, status = run_pipeline(upstream_body, "openai", request_fields=request_fields)
+    if "response_body" in result:
+        result["response"] = _extract_response_text(result.pop("response_body"), "openai")
     return jsonify(result), status
 
 
@@ -850,28 +985,28 @@ def chat_completions():
         "msg_count": len(messages),
         "user_msgs": len(user_msgs),
     }
-    result, status = run_pipeline(prompt, request_fields=request_fields)
+    result, status = run_pipeline(body, "openai", request_fields=request_fields)
     if "error" in result:
         return jsonify({
             "error": {"message": result["error"], "type": "proxy_error"},
             "trace_id": result.get("trace_id"),
         }), status
-    return jsonify(_openai_response(
-        result["response"],
-        body.get("model") or MODEL,
-        result.get("trace_id", ""),
-    )), status
+    # Return the upstream response verbatim (preserves choices, tool_calls,
+    # usage counts, etc.) so tools declared by the client keep working.
+    return jsonify(result.get("response_body") or {}), status
 
 
 @app.route("/v1/messages", methods=["POST"])
 def anthropic_messages():
     """Anthropic Messages API entry — used by Claude Code and other clients.
 
-    Honors the client's `stream` flag: when true, we still run the pipeline
-    to completion (so scan/rewrite still happen) and then re-emit the final
-    text as an Anthropic-shape SSE stream. Without this, Claude Code asks
-    for `text/event-stream`, gets JSON, and retries — showing up in the
-    logs as the same 244-char request being sent twice."""
+    Forwards the client's model/system/tools/messages verbatim to the
+    upstream `/v1/messages` endpoint; buffers the response for scanning;
+    if the scan is clean, re-emits the upstream response body as-is
+    (content blocks including tool_use are preserved). If the client
+    asked for `stream: true`, we re-emit the buffered body as an
+    Anthropic SSE stream so the media type matches what Claude Code
+    asked for."""
     body = request.get_json(silent=True) or {}
     stream = bool(body.get("stream"))
     messages = body.get("messages") or []
@@ -889,9 +1024,10 @@ def anthropic_messages():
         "msg_count": len(messages),
         "user_msgs": len(user_msgs),
         "stream": stream,
+        "has_tools": bool(body.get("tools")),
+        "has_system": bool(body.get("system")),
     }
-    result, status = run_pipeline(prompt, request_fields=request_fields)
-    model_name = body.get("model") or MODEL
+    result, status = run_pipeline(body, "anthropic", request_fields=request_fields)
     trace_id = result.get("trace_id", "")
 
     if "error" in result:
@@ -907,13 +1043,14 @@ def anthropic_messages():
             "trace_id": trace_id,
         }), status
 
+    response_body = result.get("response_body") or {}
     if stream:
         return Response(
-            _anthropic_sse_stream(result["response"], model_name, trace_id),
+            _anthropic_sse_stream(response_body, trace_id),
             status=status,
             mimetype="text/event-stream",
         )
-    return jsonify(_anthropic_response(result["response"], model_name, trace_id)), status
+    return jsonify(response_body), status
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
