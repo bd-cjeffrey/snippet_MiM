@@ -46,6 +46,9 @@ Two sets of credentials are needed:
    export BLACKDUCK_MCP_GATEWAY_KEY="sk-...your-litellm-key..."
    ```
 
+3. **JAVA** modify the source_bearer_demo.sh script to set the JAVA_HOME
+   and PATH environment variables
+
 Optional tuning:
 
 | Variable | Default | Purpose |
@@ -91,6 +94,13 @@ curl -s http://127.0.0.1:8080/health | jq
 #   "script_present": true,
 #   "max_retries": 6
 # }
+```
+
+Verify the snippet matching functionality is working. This will generate the 
+fingerprint json file of a known piece of OSS (from openSSL project), and returnlicense matches:
+
+```bash
+./test_snippet_match.sh
 ```
 
 ## Use
