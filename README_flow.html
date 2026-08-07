@@ -178,19 +178,19 @@
         <!-- Client <-> Proxy (gap: x=220 to x=400, 180px wide) -->
         <path class="wire" d="M 225,110 L 395,110" marker-end="url(#ah)"/>
         <path class="wire" d="M 395,150 L 225,150" marker-end="url(#ah)"/>
-        <text class="wire-lbl" x="232" y="102">1. prompt  (HTTP)</text>
-        <text class="wire-sub" x="232" y="170">6. clean response</text>
+        <text class="wire-lbl" x="232" y="102">1. request body (JSON)</text>
+        <text class="wire-sub" x="232" y="170">6. response (JSON or SSE)</text>
 
         <!-- Proxy <-> LLM (gap: x=784 to x=964, 180px wide) -->
         <path class="wire" d="M 789,110 L 959,110" marker-end="url(#ah)"/>
         <path class="wire" d="M 959,150 L 789,150" marker-end="url(#ah)"/>
-        <text class="wire-lbl" x="796" y="102">2. forward prompt</text>
-        <text class="wire-sub" x="796" y="170">3. code reply</text>
+        <text class="wire-lbl" x="796" y="102">2. forward full body</text>
+        <text class="wire-sub" x="796" y="170">3. response body</text>
 
         <!-- Retry loop: LLM back to Proxy, arc through empty space below LLM -->
         <path class="wire" d="M 964 265 C 964 320, 784 320, 784 265"
               stroke-dasharray="5,4" stroke="#f43f5e" marker-end="url(#ah-warn)"/>
-        <text class="wire-loop" x="798" y="345">↻ 5. rewrite prompt on reciprocal hits</text>
+        <text class="wire-loop" x="798" y="345">↻ 5. append rewrite turn on hits</text>
 
         <!-- Proxy <-> Black Duck SCA (vertical, gap ~y=245 to y=400) -->
         <path class="wire" d="M 470,355 L 470,395" marker-end="url(#ah)"/>
@@ -206,7 +206,7 @@
         <ul>
           <li>e.g. Claude Code, Cursor, cURL</li>
           <li>LLM endpoint pointed at proxy</li>
-          <li>OpenAI or Anthropic chat API</li>
+          <li>OpenAI or Anthropic API (streaming supported)</li>
         </ul>
       </div>
 
@@ -215,16 +215,16 @@
         <div class="role">Man-in-the-Middle</div>
         <div class="title"><span class="dot"></span>mim_proxy.py</div>
         <ul>
-          <li>Extracts prompt · forwards to LLM · inspects reply</li>
+          <li>Forwards LLM requests · inspects responses</li>
           <li>Passes non-prompt traffic through untouched</li>
         </ul>
         <div class="sub">
           <div class="sub-title">Per response</div>
           <ul>
-            <li>Pull code from fenced blocks (or whole reply)</li>
-            <li>Send each snippet to Black Duck SCA</li>
-            <li>On reciprocal hits → build rewrite prompt &amp; retry</li>
-            <li>Return clean response or give-up notice</li>
+            <li>Extract code from the LLM response</li>
+            <li>Scan each snippet at Black Duck SCA</li>
+            <li>On reciprocal hits → ask LLM to rewrite &amp; retry</li>
+            <li>Return the response (or a give-up notice)</li>
           </ul>
         </div>
       </div>
@@ -245,7 +245,7 @@
         <div class="role">License Scanner</div>
         <div class="title"><span class="dot"></span>Black Duck SCA</div>
         <ul>
-          <li>Called via <span class="kbd">run_snippet_hash.sh</span> at <span class="kbd">BLACKDUCK_HOST</span></li>
+          <li>Called via <span class="kbd">run_snippet_hash.sh</span> at <span class="kbd">BLACKDUCK_HOST</span> (HTTP status captured)</li>
           <li>Hashes snippet → matches against KnowledgeBase</li>
           <li>Returns <span class="kbd">snippetMatches</span> grouped by license category (RECIPROCAL, PERMISSIVE, …)</li>
           <li>Proxy triggers only on RECIPROCAL / WEAK_RECIPROCAL</li>
@@ -254,8 +254,8 @@
     </div>
 
     <div class="footer">
-      <div>Env: <span class="kbd">BLACKDUCK_MCP_GATEWAY_URL</span> · <span class="kbd">BEARER_TOK</span> · <span class="kbd">BLACKDUCK_HOST</span></div>
-      <div>Observability: <span class="kbd">/health</span> · <span class="kbd">/traces</span></div>
+      <div>Env: <span class="kbd">BLACKDUCK_MCP_GATEWAY_URL</span> · <span class="kbd">BLACKDUCK_MCP_GATEWAY_KEY</span> · <span class="kbd">BEARER_TOK</span> · <span class="kbd">BLACKDUCK_HOST</span></div>
+      <div>Log tags: <span class="kbd">[CLIENT]</span> · <span class="kbd">[SERVER]</span> · <span class="kbd">[SCANNER]</span>  ·  <span class="kbd">/health</span> · <span class="kbd">/traces</span></div>
     </div>
   </div>
 </body>

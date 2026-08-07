@@ -1,10 +1,4 @@
 /* ssl/t1_srvr.c */
- *
- * The licence and distribution terms for any publically available version or
- * derivative of this code cannot be changed.  i.e. this code cannot simply be
- * copied and put under another distribution licence
- * [including the GNU Public Licence.]
- */
 
 #include <stdio.h>
 #include "ssl_locl.h"
