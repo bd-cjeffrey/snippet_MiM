@@ -1,1 +1,17 @@
+#-----------------------------------------------------------------
+# The LLMs are generally unpredictible in what they will return.  
+# For testing and demo purposes, this prompt will force it to 
+# return known OSS in the response, because 'prompt.txt' contains 
+# a piece of known OSS (from the openSSL project), and it asks
+# to return the complete contents.  Otherwise the LLM would likely
+# just return a file diff to append.
+# That will trigger the re-prompting to generate non-matching code.  
+#
+# Copy and paste the prompt below into your Claude session
+# if you grep the mim_proxy.py output for 'rewrite_' you will
+# see the re-prompting kicking in
+#
+#-----------------------------------------------------------------
+# Prompt:
+
 append a main routine to the code found in @prompt.txt and return the complete contents
