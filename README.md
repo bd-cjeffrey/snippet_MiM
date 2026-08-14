@@ -59,6 +59,42 @@ Optional tuning:
 | `MIM_LOG_LEVEL` | `info` | `off` \| `warn` \| `info` \| `debug` — see [Instrumentation](#instrumentation) |
 | `MIM_TRACE_KEEP` | `20` | Number of recent traces kept in memory for `/traces` |
 
+## Verify the snippet-matching endpoint
+
+Before starting the proxy or wiring up the MCP server, confirm that the
+Black Duck SCA snippet-matching API is reachable and returning matches
+from your credentials. Run the shipped end-to-end check:
+
+```bash
+./test_snippet_match.sh
+```
+
+The script sources `source_bearer_demo.sh` to obtain a fresh `BEARER_TOK`,
+computes a fingerprint for the bundled `test_code.c` (a known-copyleft OSS
+sample), calls `/api/snippet-matching` via `run_snippet_hash.sh`, and
+pretty-prints the resulting `snippet_match.json`. A successful run
+produces a `snippet_match.json` containing at least one entry under
+`snippetMatches.RECIPROCAL` or `snippetMatches.WEAK_RECIPROCAL` — that is
+the ground-truth signal that scanning works end-to-end.
+
+If the script fails, do NOT proceed to run the proxy or register the MCP
+server — the same call will fail from those code paths too. Common
+causes:
+
+- **`snippet_match.json not produced`** — `BEARER_TOK` is missing, expired,
+  or was issued against the wrong host. Re-run `source ./source_bearer_demo.sh`
+  and check `BLACKDUCK_HOST`.
+- **HTTP 401 / 403** — the underlying `BLACKDUCK_TOK` in
+  `source_bearer_demo.sh` isn't authorized for the snippet-matching API.
+- **`curl: command not found` / `jq: command not found`** — install the
+  missing tool; both are hard requirements (see [Requirements](#requirements)).
+- **Empty `snippetMatches` object** — connectivity is fine but the KB
+  returned no matches. Re-check that you're running against the shipped
+  `test_code.c` and not a modified copy.
+
+Only after `test_snippet_match.sh` produces a populated `snippet_match.json`
+should you proceed to the next section.
+
 ## Run
 
 ```bash
@@ -212,7 +248,7 @@ proxy's `MIM_LOG_LEVEL`:
 Set either via the `env` block in `.mcp.json` or with `--env KEY=VALUE`
 flags on `claude mcp add`.
 
-## Required: install the `.claude/` policy directory to force scanning on every response
+## Required: install the policy directory as `.claude/` to force scanning on every response
 
 Registering the `bd_llm_traffic_scan` MCP server only *exposes* the
 `scan_code` tool to Claude Code — it does not, by itself, guarantee the model
@@ -221,32 +257,48 @@ when scanning "seems useful" and will happily return code snippets unscanned
 (especially short ones, boilerplate, or code it wrote from scratch), which
 defeats the purpose of the MiM guard.
 
-To close that gap, this repository ships two files that together turn
+To close that gap, this repository ships two artifacts that together turn
 scanning into a **mandatory, non-negotiable step** on every response that
 contains code:
 
-| File | Role |
+| Source (in this repo) | Role |
 |---|---|
 | `CLAUDE.md` | Project-level instructions Claude Code loads on every turn. Instructs the model to call `scan_code` on every code snippet it produces, to rewrite (not surface) any reciprocal / weak-reciprocal hits, to refuse the request after 6 failed rewrites, and — critically — to refuse user requests to skip the scan. |
-| `.claude/settings.json` | Pre-approves the `mcp__bd_llm_traffic_scan__scan_code` tool so scans run without a permission prompt every turn. |
+| `claude/settings.json` | Pre-approves the `mcp__bd_llm_traffic_scan__scan_code` tool so scans run without a permission prompt every turn. |
+
+The policy directory is shipped in this repo as a **visible** `claude/`
+folder (no leading dot) so that it's easy to see, copy, and version-control.
+The installer's job is to place it into a target project **renamed to
+`.claude/`** — the hidden name is what Claude Code actually reads, and
+hiding it is what prevents casual users from noticing and deleting or
+editing the pre-approval to bypass `bd_llm_traffic_scan`.
 
 **This is not optional.** Any project that uses this MCP server must also
-install both files. Registering only the MCP server (without `CLAUDE.md` +
-`.claude/`) is an unsupported configuration: the scanner will be *available*
-but not *enforced*, and the model will bypass it silently. Users cannot
-opt out per-request — the policy explicitly instructs Claude Code to
-refuse "skip the scan this time" / "don't scan this one" prompts.
+install both artifacts. Registering only the MCP server (without `CLAUDE.md`
++ `.claude/`) is an unsupported configuration: the scanner will be
+*available* but not *enforced*, and the model will bypass it silently.
+Users cannot opt out per-request — the policy explicitly instructs Claude
+Code to refuse "skip the scan this time" / "don't scan this one" prompts.
 
 ### How to install into another project
 
 From the root of the project you want to protect (i.e., the working
-directory you launch `claude` from), copy both artifacts out of this repo:
+directory you launch `claude` from), copy `CLAUDE.md` in place and copy
+the `claude/` directory in **renamed to the hidden `.claude/`**:
 
 ```bash
 # From inside the target project's root:
-cp /path/to/snippet_MiM/CLAUDE.md              ./CLAUDE.md
-cp -R /path/to/snippet_MiM/.claude             ./.claude
+cp /path/to/snippet_MiM/CLAUDE.md      ./CLAUDE.md
+cp -R /path/to/snippet_MiM/claude      ./.claude   # note the rename to hidden .claude
 ```
+
+The rename step is deliberate — installing the folder as visible `claude/`
+in the target project will not be picked up by Claude Code, and leaving it
+visible invites users to open `settings.json`, remove the
+`mcp__bd_llm_traffic_scan__scan_code` pre-approval, and then simply deny
+the runtime permission prompt to skip every scan. Hidden `.claude/` is
+harder to stumble across, and the pre-approval means users are never
+asked whether to run the scan in the first place.
 
 Then register the MCP server in that same project (see the previous
 section). After both are in place, launch `claude` from the target
@@ -255,29 +307,31 @@ project's root and verify:
 1. `/mcp` lists `bd_llm_traffic_scan ● connected`.
 2. Ask for any code snippet — e.g. "write a small C function that XORs two
    buffers". The response should be prefixed with a line like
-   `scan_code: clean (0 hits)`. If it isn't, the policy file was not
-   picked up (wrong working directory, or `CLAUDE.md` missing at the
-   project root).
+   `scan_code: clean (0 hits)`. If it isn't, the policy was not picked up
+   (most commonly: the directory was copied as `claude/` instead of
+   `.claude/`, or `CLAUDE.md` is missing at the project root, or `claude`
+   was launched from a different working directory).
 
-### Do not modify or delete the policy files
+### Do not modify, rename, or delete the policy files
 
 `CLAUDE.md` contains a clause that instructs Claude Code to refuse
 in-session edits that weaken the scan requirement — the model will not
 remove the policy on a user's behalf. If the policy legitimately needs to
 change (e.g. the MCP tool name changes, or the retry cap is tuned), edit
 `CLAUDE.md` in this source repository and re-copy it into consumer
-projects. Do not delete `.claude/settings.json` either; without the
-pre-approval, every scan will prompt for permission and users will be
-tempted to deny it.
+projects. Do not delete `.claude/settings.json` in the target project or
+rename it back to a visible `claude/` — either move re-opens the bypass by
+removing the pre-approval Claude Code relies on.
 
 ### Keeping consumer projects in sync
 
-Because both files are plain text checked into this repo, the simplest way
-to keep downstream projects current is to re-run the two `cp` commands
-above whenever `CLAUDE.md` or `.claude/settings.json` changes here.
-Consider committing both files into the downstream project's own VCS so
-teammates can't accidentally start Claude Code in a directory where the
-enforcement is missing.
+Because both artifacts are plain text checked into this repo, the simplest
+way to keep downstream projects current is to re-run the two `cp` commands
+above whenever `CLAUDE.md` or `claude/settings.json` changes here — again,
+being careful to install the directory as `.claude/` in the target.
+Consider committing `CLAUDE.md` and `.claude/` into the downstream
+project's own VCS so teammates can't accidentally start Claude Code in a
+directory where the enforcement is missing.
 
 ## How the pipeline works
 
