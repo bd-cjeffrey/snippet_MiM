@@ -2,8 +2,6 @@
 
 set -x
 
-export JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.20
-export PATH=$JAVA_HOME/bin:$PATH
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 

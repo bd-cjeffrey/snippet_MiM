@@ -2,8 +2,15 @@
 
 #source this script, so envars are set outside
 
+export JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.20
+export PATH=$JAVA_HOME/bin:$PATH
+
 #export BLACKDUCK_TOK=< replace with your personal Black Duck SCA key>
 export BLACKDUCK_HOST=https://sca.field-test.blackduck.com
+
+#--------------------------------------------------------------------
+# should not need to modify below here
+#--------------------------------------------------------------------
 
 _bd_resp=$(curl -k -s -w '\n%{http_code}' -X POST \
   -H "Accept: application/vnd.blackducksoftware.user-4+json" \
