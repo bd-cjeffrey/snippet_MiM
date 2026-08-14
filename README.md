@@ -12,6 +12,9 @@ There are 2 ways to run: either as a proxy service, or as an MCP.
 
 ## Requirements
 
+- Black Duck SCA 'sca-fingerprint-client' jar file and sca.java application to generate file fingerprints
+- Check with your Black Duck rep for access to those files
+
 - Python 3.13+
 - `curl` and `jq` on `PATH` (used by `set_envars.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
