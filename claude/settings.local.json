@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude mcp *)",
+      "Bash(MIM_MCP_LOG_LEVEL=debug MIM_MCP_LOG_FILE=/tmp/mim_mcp_debug.log timeout 3 ./run_mcp.sh)",
+      "Bash(echo \"---exit=$?---\")",
+      "Read(//tmp/**)",
+      "Bash(./.venv/bin/pip show *)",
+      "Bash(./.venv/bin/python -c \"import mcp; print\\('mcp path:', mcp.__file__\\); print\\('mcp version:', getattr\\(mcp, '__version__', 'unknown'\\)\\)\")",
+      "Bash(./.venv/bin/python -c \"from mcp.server.fastmcp import FastMCP\")",
+      "Bash(./.venv/bin/python -c \"import mcp.server; print\\(dir\\(mcp.server\\)\\)\")",
+      "Bash(./.venv/bin/python -c \"from mcp.server.mcpserver import MCPServer; print\\('MCPServer OK'\\)\")",
+      "Bash(./.venv/bin/python -c \"import mcp; print\\([x for x in dir\\(mcp\\) if 'ast' in x.lower\\(\\) or 'server' in x.lower\\(\\) or 'tool' in x.lower\\(\\)]\\)\")",
+      "Bash(./.venv/bin/pip index *)"
+    ]
+  }
+}

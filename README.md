@@ -10,7 +10,7 @@ different prompt.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.13+
 - `curl` and `jq` on `PATH` (used by `source_bearer_demo.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
 - A BlackDuck personal access token and a LiteLLM API key
@@ -82,26 +82,10 @@ Command-line flags (each also mirrors an env var):
 | `--trace-keep` | `MIM_TRACE_KEEP` | `20` |
 | `-L`, `--license-details` | `MIM_LICENSE_DETAILS` | off |
 
-The proxy listens on `127.0.0.1:$MIM_PORT`. Confirm it's up:
-
-```bash
-curl -s http://127.0.0.1:8080/health | jq
-# {
-#   "gateway_url_set": true,
-#   "gateway_key_set": true,
-#   "sca_bearer_set": true,
-#   "model": "gpt-4o-mini",
-#   "script_present": true,
-#   "max_retries": 6
-# }
-```
-
-Verify the snippet matching functionality is working. This will generate the 
-fingerprint json file of a known piece of OSS (from openSSL project), and returnlicense matches:
-
-```bash
-./test_snippet_match.sh
-```
+The proxy listens on `127.0.0.1:$MIM_PORT`. `GET /health` reports whether
+each dependency (gateway URL/key, SCA bearer, snippet script) is wired up,
+and `./test_snippet_match.sh` runs an end-to-end check against a known OSS
+sample.
 
 ## Use
 
@@ -144,63 +128,12 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
 
 ### Sending text attachments
 
-Attachments are treated as UTF-8 text (source files, logs, config). The proxy
-inlines each attachment into the prompt with fence markers, then forwards the
-combined text to the LLM:
-
-```
-<original prompt>
-
---- attachment: <filename> ---
-<contents>
---- end attachment ---
-```
-
-Non-text content (binary bytes that don't decode as UTF-8) is rejected with
-HTTP 400.
-
-**Multipart form-data**:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/proxy \
-  -F 'prompt=Find the bug in these files.' \
-  -F 'file=@./main.c' \
-  -F 'file=@./build.log'
-```
-
-Any number of file parts is accepted; the field name is ignored.
-
-**JSON**:
-
-```json
-{
-  "prompt": "Fix this:",
-  "attachments": [
-    {"filename": "app.py", "text": "def hi(): return nam\n"}
-  ]
-}
-```
-
-Either `"text": "..."` (raw string) or `"data_b64": "..."` (base64 that
-decodes to UTF-8) is accepted per attachment.
-
-**JSON prompt + raw file body** (convenient one-liner from a shell):
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/proxy \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"finish the free_ssl routine in the attached file"}' \
-  --data-binary @./prompt.txt
-```
-
-curl concatenates `-d` and `--data-binary` with `&`, sending
-`{"prompt":"..."}&<file contents>`. The proxy parses the JSON prefix and
-treats the trailing bytes as a UTF-8 text attachment named `attached`. Any
-`"attachments"` array inside the JSON is honored too — they simply add to
-whatever comes in the trailing body.
-
-Attachment metadata (`filename`, `chars`) appears in the `request` trace
-event; the full inlined prompt is only visible at `--log-level debug`.
+`/proxy` accepts UTF-8 text attachments in three shapes: multipart
+form-data (`-F 'file=@…'`), a JSON body with an `"attachments"` array
+(`{"text": "..."}` or `{"data_b64": "..."}`), or a JSON prompt with a raw
+file body appended. Each attachment is inlined into the prompt with fence
+markers before the request is forwarded upstream. Non-UTF-8 payloads are
+rejected with HTTP 400.
 
 Response fields:
 
@@ -268,60 +201,83 @@ Confirm it's connected: launch `claude`, type `/mcp`. You should see
 
 Concurrent invocations are safe — each scan runs in its own tempdir.
 
-**Debug mode.** Two env vars control MCP-server logging (independent of
-the proxy's `MIM_LOG_LEVEL`):
+**Logging.** Two env vars control MCP-server logging, independent of the
+proxy's `MIM_LOG_LEVEL`:
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `MIM_MCP_LOG_LEVEL` | `info` | `off` \| `warn` \| `info` \| `debug`. At `info` you get one line per tool call plus start/end markers and hit counts. `debug` adds the first 200 chars of the input and the list of matched (category, project, license) tuples. |
-| `MIM_MCP_LOG_FILE` | unset | Absolute path to append log lines to, in addition to stderr. Useful because MCP-subprocess stderr is often not visible in the client. |
+| Variable | Purpose |
+|---|---|
+| `MIM_MCP_LOG_LEVEL` | `off` \| `warn` \| `info` (default) \| `debug`. `debug` adds a preview of the input and the matched (category, project, license) tuples. |
+| `MIM_MCP_LOG_FILE` | Absolute path to append log lines to, in addition to stderr. Recommended because MCP-subprocess stderr is often not visible in the client. |
 
-Enable via `.mcp.json`:
+Set either via the `env` block in `.mcp.json` or with `--env KEY=VALUE`
+flags on `claude mcp add`.
 
-```json
-{
-  "mcpServers": {
-    "bd_llm_traffic_scan": {
-      "command": "/absolute/path/to/snippet_MiM/run_mcp.sh",
-      "env": {
-        "MIM_MCP_LOG_LEVEL": "debug",
-        "MIM_MCP_LOG_FILE": "/tmp/mim_mcp.log"
-      }
-    }
-  }
-}
-```
+## Required: install the `.claude/` policy directory to force scanning on every response
 
-Or via `claude mcp add`:
+Registering the `bd_llm_traffic_scan` MCP server only *exposes* the
+`scan_code` tool to Claude Code — it does not, by itself, guarantee the model
+will actually call it. Without an accompanying policy, the model decides
+when scanning "seems useful" and will happily return code snippets unscanned
+(especially short ones, boilerplate, or code it wrote from scratch), which
+defeats the purpose of the MiM guard.
+
+To close that gap, this repository ships two files that together turn
+scanning into a **mandatory, non-negotiable step** on every response that
+contains code:
+
+| File | Role |
+|---|---|
+| `CLAUDE.md` | Project-level instructions Claude Code loads on every turn. Instructs the model to call `scan_code` on every code snippet it produces, to rewrite (not surface) any reciprocal / weak-reciprocal hits, to refuse the request after 6 failed rewrites, and — critically — to refuse user requests to skip the scan. |
+| `.claude/settings.json` | Pre-approves the `mcp__bd_llm_traffic_scan__scan_code` tool so scans run without a permission prompt every turn. |
+
+**This is not optional.** Any project that uses this MCP server must also
+install both files. Registering only the MCP server (without `CLAUDE.md` +
+`.claude/`) is an unsupported configuration: the scanner will be *available*
+but not *enforced*, and the model will bypass it silently. Users cannot
+opt out per-request — the policy explicitly instructs Claude Code to
+refuse "skip the scan this time" / "don't scan this one" prompts.
+
+### How to install into another project
+
+From the root of the project you want to protect (i.e., the working
+directory you launch `claude` from), copy both artifacts out of this repo:
 
 ```bash
-claude mcp add bd_llm_traffic_scan "$PWD/run_mcp.sh" \
-  --env MIM_MCP_LOG_LEVEL=debug \
-  --env MIM_MCP_LOG_FILE=/tmp/mim_mcp.log
+# From inside the target project's root:
+cp /path/to/snippet_MiM/CLAUDE.md              ./CLAUDE.md
+cp -R /path/to/snippet_MiM/.claude             ./.claude
 ```
 
-Then `tail -f /tmp/mim_mcp.log` while driving Claude Code to watch scans
-happen in real time. Example info-level output for one clean call:
+Then register the MCP server in that same project (see the previous
+section). After both are in place, launch `claude` from the target
+project's root and verify:
 
-```
-10:24:11 INFO  [mcp] scan_code called chars=1058 nws=812
-10:24:11 INFO  [mcp] scan_start nws=812
-10:24:13 INFO  [mcp] scan_ok ms=1613 http_status=200 hits=0 clean
-```
+1. `/mcp` lists `bd_llm_traffic_scan ● connected`.
+2. Ask for any code snippet — e.g. "write a small C function that XORs two
+   buffers". The response should be prefixed with a line like
+   `scan_code: clean (0 hits)`. If it isn't, the policy file was not
+   picked up (wrong working directory, or `CLAUDE.md` missing at the
+   project root).
 
-And for a hit:
+### Do not modify or delete the policy files
 
-```
-10:26:44 INFO  [mcp] scan_code called chars=1058 nws=812
-10:26:44 INFO  [mcp] scan_start nws=812
-10:26:46 INFO  [mcp] scan_ok ms=1712 http_status=200 hits=3
-```
+`CLAUDE.md` contains a clause that instructs Claude Code to refuse
+in-session edits that weaken the scan requirement — the model will not
+remove the policy on a user's behalf. If the policy legitimately needs to
+change (e.g. the MCP tool name changes, or the retry cap is tuned), edit
+`CLAUDE.md` in this source repository and re-copy it into consumer
+projects. Do not delete `.claude/settings.json` either; without the
+pre-approval, every scan will prompt for permission and users will be
+tempted to deny it.
 
-Example prompts you can paste into Claude Code to exercise it:
+### Keeping consumer projects in sync
 
-- **Hit path** — "Call the `scan_code` tool with the exact contents of `test_code.c` and summarize the hits." Expect `clean: false` with OpenSSL / GPL matches (same fixture as `test_snippet_match.sh`).
-- **Skip path** — "Call `scan_code` with `int x = 1;`". Expect `{clean: true, skipped: true}`.
-- **Error path** — restart the server without a valid `BEARER_TOK` and repeat the hit-path prompt. Expect a structured `error` string rather than a crash.
+Because both files are plain text checked into this repo, the simplest way
+to keep downstream projects current is to re-run the two `cp` commands
+above whenever `CLAUDE.md` or `.claude/settings.json` changes here.
+Consider committing both files into the downstream project's own VCS so
+teammates can't accidentally start Claude Code in a directory where the
+enforcement is missing.
 
 ## How the pipeline works
 
@@ -351,110 +307,27 @@ Example prompts you can paste into Claude Code to exercise it:
    loop iterates. After `MIM_MAX_RETRIES` failed rewrites the proxy returns
    `clean: false` with a message telling the caller to try a different prompt.
 
-With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`):
-
-- The proxy logs every unique license identified by the snippet match on its
-  own line (one per `(category, license)`), so you can see what triggered a
-  rewrite without pulling the full trace. Example log output:
-
-  ```
-  12:03:45 INFO  [28465c0e] hits count=3 unique=2 sample=['RECIPROCAL:openssl','WEAK_RECIPROCAL:mpl-project']
-  12:03:45 INFO  [28465c0e] licenses count=2
-  12:03:45 INFO  [28465c0e]   [RECIPROCAL] GNU General Public License v3.0 or later (SPDX: GPL-3.0-or-later, ownership: OPEN_SOURCE) <- openssl 1.0.1g
-  12:03:45 INFO  [28465c0e]   [WEAK_RECIPROCAL] Mozilla Public License 2.0 (SPDX: MPL-2.0, ownership: OPEN_SOURCE) <- mpl-project 1.2
-  ```
-
-- Each match line in the rewrite prompt sent back to the LLM is followed by
-  indented rows carrying `spdx`, ownership, the matched file path, and the
-  source/matched line ranges pulled from `snippet_match.json`. Example:
-
-```
-  - [RECIPROCAL] 4MLinux 1.0.1g -> GNU General Public License v3.0 or later
-      spdx: GPL-3.0-or-later  (OPEN_SOURCE)
-      matched file: /openssl-1.0.1g/crypto/o_init.c
-      matched lines: 28-79
-      your lines:    29-81
-```
-
-Off by default because it adds tokens on every rewrite attempt; turn it on
-when you want the LLM to see which lines and which SPDX ids are at issue.
+With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`) the proxy
+additionally logs one line per unique license triggering a rewrite (SPDX
+id, ownership, matching project) and includes the same metadata plus
+source/matched line ranges in the rewrite prompt sent upstream. Off by
+default because it adds tokens on every rewrite attempt; turn it on when
+you want the LLM to see exactly which lines and SPDX ids are at issue.
 
 ## Instrumentation
 
 The proxy emits structured log lines and keeps an in-memory ring buffer of
-recent traces so you can watch — and later inspect — what the pipeline is
-doing.
+recent traces (last `MIM_TRACE_KEEP` requests) so you can inspect what the
+pipeline did after the fact.
 
-**Log level.** Set `MIM_LOG_LEVEL` before starting:
-
-- `off` — silence everything, including werkzeug access lines
-- `warn` — only errors
-- `info` (default) — one line per pipeline event
-- `debug` — adds the underlying HTTP request logs from `urllib3`
-
-Every log line starts with a **side tag** identifying which leg of the
-pipeline the line describes:
-
-| Tag | Meaning |
-|---|---|
-| `[CLIENT ]` | proxy ↔ the caller (a coding agent, `curl`, etc.) |
-| `[SERVER ]` | proxy ↔ the upstream LLM gateway |
-| `[SCANNER]` | proxy ↔ the Black Duck snippet-matching endpoint |
-
-Every request also gets a short hex trace id used as a second prefix on log
-lines and returned in the JSON response as `trace_id`, so you can correlate
-output across streams.
-
-Example info-level output for a clean request:
-
-```
-11:01:23 INFO  [CLIENT ] [28465c0e] request prompt_chars=45
-11:01:23 INFO  [SERVER ] [28465c0e] attempt_start n=1 prompt_chars=45
-11:01:30 INFO  [SERVER ] [28465c0e] upstream_ok ms=6905 resp_chars=1963
-11:01:30 INFO  [SCANNER] [28465c0e] code_blocks found=1 files=1 sizes=[1058]
-11:01:30 INFO  [SCANNER] [28465c0e] scan_start idx=0 bytes=1058
-11:01:31 INFO  [SCANNER] [28465c0e] scan_ok idx=0 bytes=1058 ms=1610 http_status=200
-11:01:31 INFO  [SCANNER] [28465c0e] clean
-11:01:31 INFO  [CLIENT ] [28465c0e] done outcome=clean
-```
-
-Emitted event kinds:
-
-| Kind | When | Useful fields |
-|---|---|---|
-| `request` | request received | `prompt_chars` |
-| `attempt_start` | before each round trip to the LLM | `n`, `prompt_chars` |
-| `upstream_ok` | LLM responded | `ms`, `resp_chars` |
-| `gateway_error` | LLM call failed | `err` |
-| `no_fences_using_whole_response` | assistant returned raw code without fences; whole response is scanned | `chars` |
-| `empty_response` | assistant returned an empty message | — |
-| `code_blocks` | after extraction/grouping | `found`, `files`, `sizes` |
-| `scan_start` | about to invoke `run_snippet_hash.sh` for one file | `idx`, `bytes` |
-| `scan_ok` | one file scanned successfully | `idx`, `bytes`, `ms`, `http_status` |
-| `scan_result_error` | scan returned a body indicating failure | `idx`, `bytes`, `ms`, `http_status`, `err` |
-| `scan_error` | scan couldn't be executed at all | `err` |
-| `scan_all_failed` | every file's scan failed in this attempt | `count` |
-| `hits` | reciprocal matches found | `count`, `unique`, `sample` |
-| `licenses` | with `-L`, followed by one log line per unique license identified | `count` |
-| `clean` | no matches | — |
-| `rewrite_prompt` | re-prompt is about to be sent | — |
-| `done` | terminal state for the request | `outcome` |
-
-**Recent-request inspector.** Two endpoints let you pull traces back after the
-fact — handy when a coding agent, not you, is driving the proxy:
-
-- `GET /traces` — compact list of the last `MIM_TRACE_KEEP` requests
-  (newest first), one line per request with `trace_id`, `outcome`,
-  `duration_ms`, `events` count, and prompt preview.
-- `GET /traces/<trace_id>` — the full event stream for one request, with
-  monotonic `t_ms` offsets so you can see where the time went.
-
-```bash
-curl -s http://127.0.0.1:8080/traces | jq
-curl -s http://127.0.0.1:8080/traces/28465c0e | jq
-```
-
-Traces live in process memory only — restarting the proxy clears them.
+- **Log level** is controlled by `MIM_LOG_LEVEL` (`off` | `warn` | `info` |
+  `debug`). Each line is tagged with the leg it describes — `[CLIENT ]`,
+  `[SERVER ]`, or `[SCANNER]` — plus a per-request trace id that also
+  appears in the JSON response as `trace_id`.
+- **Trace inspector** — `GET /traces` returns a compact list of recent
+  requests, and `GET /traces/<trace_id>` returns the full event stream
+  with monotonic `t_ms` offsets. Traces live in process memory only and
+  are cleared on restart.
 
 ## Troubleshooting
 

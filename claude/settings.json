@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__bd_llm_traffic_scan__scan_code"
+    ]
+  }
+}
