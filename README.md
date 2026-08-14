@@ -31,6 +31,8 @@ chmod +x run_snippet_hash.sh set_envars.sh test_snippet_match.sh run_server.sh r
 
 ## Configure environment
 
+Modify set_envars.sh  to update environment variables
+
 Two sets of credentials are needed:
 
 1. **BlackDuck SCA** (used by `run_snippet_hash.sh` to call `/api/snippet-matching`).
@@ -54,15 +56,6 @@ Two sets of credentials are needed:
 3. **JAVA** modify the set_envars.sh script to set the JAVA_HOME
    and PATH environment variables
 
-Optional tuning:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MIM_MODEL` | `gpt-4o-mini` | Model name sent to LiteLLM |
-| `MIM_MAX_RETRIES` | `6` | Rewrite attempts before giving up |
-| `MIM_PORT` | `8080` | Local port the proxy binds to |
-| `MIM_LOG_LEVEL` | `info` | `off` \| `warn` \| `info` \| `debug` — see [Instrumentation](#instrumentation) |
-| `MIM_TRACE_KEEP` | `20` | Number of recent traces kept in memory for `/traces` |
 
 ## Verify the snippet-matching endpoint
 
