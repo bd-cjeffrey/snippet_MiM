@@ -212,6 +212,117 @@ Response fields:
 - `message` — user-facing note when the proxy exhausted retries
 - `note` — set when a response had no fenced code blocks (nothing to scan)
 
+## Use as an MCP tool in Claude Code
+
+The same scan capability is also available as an MCP (Model Context Protocol)
+stdio server, so Claude Code can invoke it directly during a conversation —
+no need to route the whole session through the HTTP proxy. The model calls
+the tool when it wants to check code it has just written and decides itself
+how to react to hits.
+
+Install the new dep (adds `mcp` to what the proxy already needs):
+
+```bash
+./.venv/bin/pip install -r requirements.txt
+```
+
+Register the server with Claude Code (one time):
+
+```bash
+source ./source_bearer_demo.sh
+claude mcp add bd_llm_traffic_scan "$PWD/run_mcp.sh"
+```
+
+`run_mcp.sh` re-sources `source_bearer_demo.sh` on each launch, so the
+short-lived `BEARER_TOK` is refreshed whenever Claude Code (re)spawns the
+subprocess. `BLACKDUCK_HOST` is set the same way. The server still starts
+without these — every `scan_code` call just returns a structured `error`
+field until they're present.
+
+Project-scoped alternative — drop this in `.mcp.json` at the repo root
+where you want the tool available:
+
+```json
+{
+  "mcpServers": {
+    "bd_llm_traffic_scan": {
+      "command": "/absolute/path/to/snippet_MiM/run_mcp.sh"
+    }
+  }
+}
+```
+
+Confirm it's connected: launch `claude`, type `/mcp`. You should see
+`bd_llm_traffic_scan ● connected` with one tool listed.
+
+**Tool: `scan_code(code: str) → dict`**
+
+| Field | Meaning |
+|---|---|
+| `clean` | `true` if no RECIPROCAL / WEAK_RECIPROCAL matches |
+| `hits` | list of `{category, project, version, license, spdx, ownership, path, source_start, source_end, matched_start, matched_end}` |
+| `summary` | one-line human-readable summary |
+| `http_status` | HTTP status from the SCA scan endpoint (or `null`) |
+| `skipped` | present and `true` when input was too small to scan (<300 non-ws chars) |
+| `error` | present when the scan itself failed (missing bearer, HTTP 4xx, malformed response, timeout) |
+
+Concurrent invocations are safe — each scan runs in its own tempdir.
+
+**Debug mode.** Two env vars control MCP-server logging (independent of
+the proxy's `MIM_LOG_LEVEL`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MIM_MCP_LOG_LEVEL` | `info` | `off` \| `warn` \| `info` \| `debug`. At `info` you get one line per tool call plus start/end markers and hit counts. `debug` adds the first 200 chars of the input and the list of matched (category, project, license) tuples. |
+| `MIM_MCP_LOG_FILE` | unset | Absolute path to append log lines to, in addition to stderr. Useful because MCP-subprocess stderr is often not visible in the client. |
+
+Enable via `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "bd_llm_traffic_scan": {
+      "command": "/absolute/path/to/snippet_MiM/run_mcp.sh",
+      "env": {
+        "MIM_MCP_LOG_LEVEL": "debug",
+        "MIM_MCP_LOG_FILE": "/tmp/mim_mcp.log"
+      }
+    }
+  }
+}
+```
+
+Or via `claude mcp add`:
+
+```bash
+claude mcp add bd_llm_traffic_scan "$PWD/run_mcp.sh" \
+  --env MIM_MCP_LOG_LEVEL=debug \
+  --env MIM_MCP_LOG_FILE=/tmp/mim_mcp.log
+```
+
+Then `tail -f /tmp/mim_mcp.log` while driving Claude Code to watch scans
+happen in real time. Example info-level output for one clean call:
+
+```
+10:24:11 INFO  [mcp] scan_code called chars=1058 nws=812
+10:24:11 INFO  [mcp] scan_start nws=812
+10:24:13 INFO  [mcp] scan_ok ms=1613 http_status=200 hits=0 clean
+```
+
+And for a hit:
+
+```
+10:26:44 INFO  [mcp] scan_code called chars=1058 nws=812
+10:26:44 INFO  [mcp] scan_start nws=812
+10:26:46 INFO  [mcp] scan_ok ms=1712 http_status=200 hits=3
+```
+
+Example prompts you can paste into Claude Code to exercise it:
+
+- **Hit path** — "Call the `scan_code` tool with the exact contents of `test_code.c` and summarize the hits." Expect `clean: false` with OpenSSL / GPL matches (same fixture as `test_snippet_match.sh`).
+- **Skip path** — "Call `scan_code` with `int x = 1;`". Expect `{clean: true, skipped: true}`.
+- **Error path** — restart the server without a valid `BEARER_TOK` and repeat the hit-path prompt. Expect a structured `error` string rather than a crash.
+
 ## How the pipeline works
 
 1. `POST /proxy` forwards `{model, messages: [{role: user, content: prompt}]}`

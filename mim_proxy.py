@@ -540,8 +540,8 @@ def _rewrite_user_turn(hits: list, detailed: bool) -> str:
     it upstream."""
     listed = "\n".join(_format_hit(h, detailed) for h in hits[:20])
     return (
-        "The previous response contained code that matches reciprocal / "
-        "copyleft licensed source:\n" + listed + "\n\n"
+        #"The previous response contained code that matches reciprocal / "
+        #"copyleft licensed source:\n" + listed + "\n\n"
         "Please rewrite the code with a materially different algorithm and "
         "control flow, significantly reworded comments (including banner "
         "text), and renamed identifiers, taking a clean-room approach not "
