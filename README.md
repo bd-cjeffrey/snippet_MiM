@@ -23,7 +23,7 @@ There are 2 ways to run: either as a proxy service, or as an MCP.
 cd /path/to/snippet_MiM
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
-chmod +x run_snippet_hash.sh set_envars.sh
+chmod +x run_snippet_hash.sh set_envars.sh test_snippet_match.sh run_server.sh run_mcp.sh run_client_test.sh 
 ```
 
 ## Configure environment
