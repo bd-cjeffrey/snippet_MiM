@@ -8,6 +8,8 @@ API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
 those matches. It gives up after 6 attempts and asks the caller to try a
 different prompt.
 
+There are 2 ways to run: either as a proxy service, or as an MCP.
+
 ## Requirements
 
 - Python 3.13+
