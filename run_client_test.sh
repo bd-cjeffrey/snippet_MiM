@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source ./source_bearer_demo.sh
+source ./set_envars.sh
 
 curl -s -X POST http://127.0.0.1:8080/proxy \
 -H 'Content-Type: application/json' \

@@ -7,7 +7,7 @@
 
 set -x
 
-source ./source_bearer_demo.sh
+source ./set_envars.sh
 
 ./run_snippet_hash.sh ./test_code.c
 

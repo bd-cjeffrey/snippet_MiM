@@ -13,7 +13,7 @@ There are 2 ways to run: either as a proxy service, or as an MCP.
 ## Requirements
 
 - Python 3.13+
-- `curl` and `jq` on `PATH` (used by `source_bearer_demo.sh` and `run_snippet_hash.sh`)
+- `curl` and `jq` on `PATH` (used by `set_envars.sh` and `run_snippet_hash.sh`)
 - Network access to both the BlackDuck SCA host and the MCP/LiteLLM gateway
 - A BlackDuck personal access token and a LiteLLM API key
 
@@ -23,7 +23,7 @@ There are 2 ways to run: either as a proxy service, or as an MCP.
 cd /path/to/snippet_MiM
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
-chmod +x run_snippet_hash.sh source_bearer_demo.sh
+chmod +x run_snippet_hash.sh set_envars.sh
 ```
 
 ## Configure environment
@@ -31,14 +31,14 @@ chmod +x run_snippet_hash.sh source_bearer_demo.sh
 Two sets of credentials are needed:
 
 1. **BlackDuck SCA** (used by `run_snippet_hash.sh` to call `/api/snippet-matching`).
-   `source_bearer_demo.sh` exchanges a BlackDuck token for a short-lived bearer
+   `set_envars.sh` exchanges a BlackDuck token for a short-lived bearer
    and exports `BEARER_TOK` and `BLACKDUCK_HOST`:
 
    ```bash
-   source ./source_bearer_demo.sh
+   source ./set_envars.sh
    ```
 
-   Edit `source_bearer_demo.sh` if you need to swap in a different `BLACKDUCK_TOK`
+   Edit `set_envars.sh` if you need to swap in a different `BLACKDUCK_TOK`
    or `BLACKDUCK_HOST`.
 
 2. **LLM gateway** (LiteLLM at `$BLACKDUCK_MCP_GATEWAY_URL`):
@@ -48,7 +48,7 @@ Two sets of credentials are needed:
    export BLACKDUCK_MCP_GATEWAY_KEY="sk-...your-litellm-key..."
    ```
 
-3. **JAVA** modify the source_bearer_demo.sh script to set the JAVA_HOME
+3. **JAVA** modify the set_envars.sh script to set the JAVA_HOME
    and PATH environment variables
 
 Optional tuning:
@@ -71,7 +71,7 @@ from your credentials. Run the shipped end-to-end check:
 ./test_snippet_match.sh
 ```
 
-The script sources `source_bearer_demo.sh` to obtain a fresh `BEARER_TOK`,
+The script sources `set_envars.sh` to obtain a fresh `BEARER_TOK`,
 computes a fingerprint for the bundled `test_code.c` (a known-copyleft OSS
 sample), calls `/api/snippet-matching` via `run_snippet_hash.sh`, and
 pretty-prints the resulting `snippet_match.json`. A successful run
@@ -84,10 +84,10 @@ server — the same call will fail from those code paths too. Common
 causes:
 
 - **`snippet_match.json not produced`** — `BEARER_TOK` is missing, expired,
-  or was issued against the wrong host. Re-run `source ./source_bearer_demo.sh`
+  or was issued against the wrong host. Re-run `source ./set_envars.sh`
   and check `BLACKDUCK_HOST`.
 - **HTTP 401 / 403** — the underlying `BLACKDUCK_TOK` in
-  `source_bearer_demo.sh` isn't authorized for the snippet-matching API.
+  `set_envars.sh` isn't authorized for the snippet-matching API.
 - **`curl: command not found` / `jq: command not found`** — install the
   missing tool; both are hard requirements (see [Requirements](#requirements)).
 - **Empty `snippetMatches` object** — connectivity is fine but the KB
@@ -200,11 +200,11 @@ Install the new dep (adds `mcp` to what the proxy already needs):
 Register the server with Claude Code (one time):
 
 ```bash
-source ./source_bearer_demo.sh
+source ./set_envars.sh
 claude mcp add bd_llm_traffic_scan "$PWD/run_mcp.sh"
 ```
 
-`run_mcp.sh` re-sources `source_bearer_demo.sh` on each launch, so the
+`run_mcp.sh` re-sources `set_envars.sh` on each launch, so the
 short-lived `BEARER_TOK` is refreshed whenever Claude Code (re)spawns the
 subprocess. `BLACKDUCK_HOST` is set the same way. The server still starts
 without these — every `scan_code` call just returns a structured `error`
@@ -392,7 +392,7 @@ pipeline did after the fact.
   set `BLACKDUCK_MCP_GATEWAY_KEY` to an `sk-...` LiteLLM key, not the SCA
   `BEARER_TOK`.
 - **`snippet_match.json not produced`** — `run_snippet_hash.sh` failed. Check
-  `BEARER_TOK` and `BLACKDUCK_HOST`; re-source `source_bearer_demo.sh` (the
+  `BEARER_TOK` and `BLACKDUCK_HOST`; re-source `set_envars.sh` (the
   bearer is short-lived).
 - **`note: no fenced code blocks; nothing scanned`** — the LLM's reply had no
   ` ```lang ... ``` ` blocks, so there was nothing to check. Ask for code in a

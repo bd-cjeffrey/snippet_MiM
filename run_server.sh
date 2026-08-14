@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source ./source_bearer_demo.sh
+source ./set_envars.sh
 
 export PYTHONWARNINGS="ignore:Unverified HTTPS request"
 

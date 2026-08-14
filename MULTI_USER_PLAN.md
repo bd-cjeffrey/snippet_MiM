@@ -18,7 +18,7 @@ without a full rewrite up front.
 |---|---|---|
 | Identity | none — anyone on `127.0.0.1` is trusted | per-user API key or bearer, mapped to a user record |
 | Upstream credentials | single `BLACKDUCK_MCP_GATEWAY_KEY` in env | per-user key (server-side) or client-forwarded key |
-| Scanner credentials | single `BEARER_TOK`, refreshed manually via `source_bearer_demo.sh` | in-process refresh loop with a Black Duck PAT, per-tenant if needed |
+| Scanner credentials | single `BEARER_TOK`, refreshed manually via `set_envars.sh` | in-process refresh loop with a Black Duck PAT, per-tenant if needed |
 | Config | env vars + CLI flags at startup | per-user policy (allowed models, retry cap, license-details, …) in a datastore, editable at runtime |
 | Traces | in-memory `deque(maxlen=20)` | persisted per user, retrievable only by that user (and admins) |
 | Server | Flask dev server, single process | production WSGI (gunicorn) or ASGI (hypercorn), horizontally scalable |
