@@ -93,7 +93,7 @@ causes:
 Only after `test_snippet_match.sh` produces a populated `snippet_match.json`
 should you proceed to the next section.
 
-## Run
+## Option 1: Run the Proxy
 
 ```bash
 ./.venv/bin/python mim_proxy.py
@@ -179,7 +179,9 @@ Response fields:
 - `message` — user-facing note when the proxy exhausted retries
 - `note` — set when a response had no fenced code blocks (nothing to scan)
 
-## Use as an MCP tool in Claude Code
+## Option 2: Use as an MCP tool
+
+(tested in Claude Code)
 
 The same scan capability is also available as an MCP (Model Context Protocol)
 stdio server, so Claude Code can invoke it directly during a conversation —
