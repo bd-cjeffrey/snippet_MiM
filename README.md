@@ -123,6 +123,12 @@ sample.
 
 ## Use
 
+**Redirect Claude to the proxy, and start Claude**
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+claude
+```
+
 The proxy exposes three shapes of endpoint:
 
 | Route | Purpose |
