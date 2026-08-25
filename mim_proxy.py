@@ -36,9 +36,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -81,6 +83,28 @@ if LOG_LEVEL_NAME == "off":
 
 TRACES: "deque[dict]" = deque(maxlen=TRACE_KEEP)
 
+METRICS_FILE = os.environ.get("MIM_METRICS_FILE") or str(APP_DIR / "metrics.jsonl")
+_METRICS_LOCK = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _log_metric(record: dict) -> None:
+    """Append one JSON line to the metrics file. Writes are lock-serialized so
+    concurrent Flask threads don't interleave. Failures are logged but never
+    raised — a metrics-write hiccup shouldn't kill a request."""
+    if not METRICS_FILE:
+        return
+    try:
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        with _METRICS_LOCK:
+            with open(METRICS_FILE, "a") as f:
+                f.write(line)
+    except OSError as e:
+        log.warning("metrics write to %s failed: %s", METRICS_FILE, e)
+
 # Tags identifying which leg of the pipeline a log line belongs to. All tags
 # are the same width so the columns line up when tailing the log.
 SIDE_CLIENT = "CLIENT "   # proxy <-> the coding agent (or curl) that called us
@@ -95,6 +119,7 @@ class Trace:
     def __init__(self, prompt: str):
         self.id = uuid.uuid4().hex[:8]
         self.t0 = time.monotonic()
+        self.start_ts = _now_iso()
         self.prompt_preview = prompt[:200]
         self.events: list = []
         self.outcome: str = "pending"
@@ -113,15 +138,27 @@ class Trace:
         else:
             log.info("[%s] [%s] %s", side, self.id, kind)
 
-    def finish(self, outcome: str) -> None:
+    def finish(self, outcome: str, channel: str = "", attempts: int = 1,
+               hits: int = 0) -> None:
         self.outcome = outcome
         self.event("done", side=SIDE_CLIENT, outcome=outcome)
+        duration_ms = int((time.monotonic() - self.t0) * 1000)
         TRACES.append({
             "trace_id": self.id,
             "prompt_preview": self.prompt_preview,
-            "duration_ms": int((time.monotonic() - self.t0) * 1000),
+            "duration_ms": duration_ms,
             "outcome": outcome,
             "events": self.events,
+        })
+        _log_metric({
+            "ts": self.start_ts,
+            "trace_id": self.id,
+            "channel": channel,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "attempts": attempts,
+            "reprompts": max(0, attempts - 1),
+            "hits": hits,
         })
 
 
@@ -614,7 +651,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             response_body = forward_to_gateway(current_body, endpoint)
         except Exception as e:
             trace.event("gateway_error", side=SIDE_SERVER, err=str(e)[:200])
-            trace.finish("gateway_error")
+            trace.finish("gateway_error", channel=channel, attempts=attempt + 1)
             return {"error": f"gateway request failed: {e}", "trace_id": trace.id}, 502
 
         response_text = _extract_response_text(response_body, channel)
@@ -632,7 +669,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             source = "whole_response"
         if not blocks:
             trace.event("empty_response", side=SIDE_SERVER)
-            trace.finish("no_code")
+            trace.finish("no_code", channel=channel, attempts=attempt + 1)
             return {
                 "response_body": response_body,
                 "attempts": attempt + 1,
@@ -693,7 +730,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
                     )
         except Exception as e:
             trace.event("scan_error", side=SIDE_SCANNER, err=str(e)[:200])
-            trace.finish("scan_error")
+            trace.finish("scan_error", channel=channel, attempts=attempt + 1)
             return {
                 "error": f"snippet scan failed: {e}",
                 "response_body": response_body,
@@ -703,7 +740,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
 
         if scan_errors and len(scan_errors) == len(files):
             trace.event("scan_all_failed", side=SIDE_SCANNER, count=len(scan_errors))
-            trace.finish("scan_error")
+            trace.finish("scan_error", channel=channel, attempts=attempt + 1)
             return {
                 "error": "all snippet-match scans returned errors",
                 "response_body": response_body,
@@ -741,7 +778,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             trace.event("clean", side=SIDE_SCANNER)
 
         if not hits:
-            trace.finish("clean")
+            trace.finish("clean", channel=channel, attempts=attempt + 1, hits=0)
             return {
                 "response_body": response_body,
                 "attempts": attempt + 1,
@@ -751,7 +788,8 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             }, 200
 
         if attempt >= MAX_RETRIES:
-            trace.finish("give_up")
+            trace.finish("give_up", channel=channel, attempts=attempt + 1,
+                         hits=len(hits))
             return {
                 "response_body": response_body,
                 "attempts": attempt + 1,
@@ -773,7 +811,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             SIDE_SERVER, trace.id, len(current_body.get("messages") or []),
         )
 
-    trace.finish("unreachable")
+    trace.finish("unreachable", channel=channel)
     return {"error": "unreachable", "trace_id": trace.id}, 500
 
 
@@ -1072,6 +1110,7 @@ def health():
         "trace_keep": TRACE_KEEP,
         "license_details": LICENSE_DETAILS,
         "traces_held": len(TRACES),
+        "metrics_file": METRICS_FILE,
     })
 
 
@@ -1134,6 +1173,12 @@ def _parse_args(argv):
         help="include SPDX id, matched file path, and line ranges from the snippet scan "
              "in the rewrite prompt (overrides MIM_LICENSE_DETAILS; default: off)",
     )
+    p.add_argument(
+        "--metrics-file", default=None,
+        help="path to metrics JSONL file (overrides MIM_METRICS_FILE; "
+             "default: metrics.jsonl next to mim_proxy.py). Pass an empty "
+             "string to disable.",
+    )
     return p.parse_args(argv)
 
 
@@ -1157,6 +1202,8 @@ if __name__ == "__main__":
         TRACES = deque(_existing[-TRACE_KEEP:], maxlen=TRACE_KEEP)
     if args.license_details:
         LICENSE_DETAILS = True
+    if args.metrics_file is not None:
+        METRICS_FILE = args.metrics_file
 
     if not GATEWAY_URL:
         print("warning: BLACKDUCK_MCP_GATEWAY_URL is not set", file=sys.stderr)
@@ -1165,4 +1212,5 @@ if __name__ == "__main__":
         sys.exit(1)
 
     port = args.port if args.port is not None else int(os.environ.get("MIM_PORT", "8080"))
+    _log_metric({"event": "startup", "ts": _now_iso(), "pid": os.getpid(), "port": port})
     app.run(host="127.0.0.1", port=port, debug=False)

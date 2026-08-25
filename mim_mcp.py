@@ -15,11 +15,16 @@ Env:
                                 a structured error instead of crashing).
 """
 
+import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
 # Log to stderr BEFORE importing mim_proxy — its module-level logging.basicConfig
 # call would otherwise default to stdout in some setups, and stdout is the
@@ -55,10 +60,36 @@ from mim_proxy import (  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 log = logging.getLogger("mim_mcp")
+
+APP_DIR = Path(__file__).resolve().parent
+METRICS_FILE = os.environ.get("MIM_MCP_METRICS_FILE") or str(APP_DIR / "mcp_metrics.jsonl")
+_METRICS_LOCK = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _log_metric(record: dict) -> None:
+    """Append one JSON line to the MCP metrics file. Writes are lock-serialized
+    so concurrent scan_code calls don't interleave. Failures are logged but
+    never raised — a metrics-write hiccup shouldn't kill a tool call."""
+    if not METRICS_FILE:
+        return
+    try:
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        with _METRICS_LOCK:
+            with open(METRICS_FILE, "a") as f:
+                f.write(line)
+    except OSError as e:
+        log.warning("metrics write to %s failed: %s", METRICS_FILE, e)
+
+
 log.info(
-    "starting bd_llm_traffic_scan MCP server (log_level=%s%s)",
+    "starting bd_llm_traffic_scan MCP server (log_level=%s%s, metrics_file=%s)",
     LOG_LEVEL_NAME,
     f", log_file={LOG_FILE}" if LOG_FILE else "",
+    METRICS_FILE or "off",
 )
 mcp = FastMCP("bd_llm_traffic_scan")
 
@@ -86,12 +117,28 @@ def scan_code(code: str) -> dict:
 
     Concurrent calls are safe: each invocation runs in its own tempdir.
     """
+    call_id = uuid.uuid4().hex[:8]
+    start_ts = _now_iso()
+    func_t0 = time.monotonic()
     nws = _non_ws_len(code)
-    log.info("scan_code called chars=%d nws=%d", len(code), nws)
+    log.info("scan_code called call_id=%s chars=%d nws=%d", call_id, len(code), nws)
     log.debug("scan_code input head: %r", code[:200])
+
+    def _finish(outcome: str, hits: int = 0, http_status=None) -> None:
+        _log_metric({
+            "ts": start_ts,
+            "call_id": call_id,
+            "tool": "scan_code",
+            "outcome": outcome,
+            "duration_ms": int((time.monotonic() - func_t0) * 1000),
+            "nws": nws,
+            "hits": hits,
+            "http_status": http_status,
+        })
 
     if nws < SMALL_SNIPPET_LIMIT:
         log.info("scan_skipped reason=too_small nws=%d limit=%d", nws, SMALL_SNIPPET_LIMIT)
+        _finish("skipped_small")
         return {
             "clean": True,
             "hits": [],
@@ -101,6 +148,7 @@ def scan_code(code: str) -> dict:
         }
     if nws > LARGE_SNIPPET_LIMIT:
         log.info("scan_skipped reason=too_large nws=%d limit=%d", nws, LARGE_SNIPPET_LIMIT)
+        _finish("rejected_large")
         return {
             "clean": False,
             "hits": [],
@@ -119,6 +167,7 @@ def scan_code(code: str) -> dict:
     except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         elapsed = int((time.monotonic() - t0) * 1000)
         log.warning("scan_error ms=%d err=%s", elapsed, e)
+        _finish("scan_error")
         return {
             "clean": False,
             "hits": [],
@@ -133,6 +182,7 @@ def scan_code(code: str) -> dict:
     if err:
         log.info("scan_result_error ms=%d http_status=%s err=%s",
                  elapsed, http_status, err[:200])
+        _finish("scan_result_error", http_status=http_status)
         return {
             "clean": False,
             "hits": [],
@@ -149,8 +199,10 @@ def scan_code(code: str) -> dict:
         log.info("rewrite_required hits=%d sample=%r", len(hits), sample)
         log.debug("hits detail: %r",
                   [(h.get("category"), h.get("project"), h.get("license")) for h in hits])
+        _finish("hits", hits=len(hits), http_status=http_status)
     else:
         log.info("scan_ok ms=%d http_status=%s clean", elapsed, http_status)
+        _finish("clean", http_status=http_status)
     return {
         "clean": not hits,
         "hits": hits,
@@ -163,4 +215,10 @@ def scan_code(code: str) -> dict:
 
 
 if __name__ == "__main__":
+    _log_metric({
+        "event": "startup",
+        "ts": _now_iso(),
+        "pid": os.getpid(),
+        "log_level": LOG_LEVEL_NAME,
+    })
     mcp.run()

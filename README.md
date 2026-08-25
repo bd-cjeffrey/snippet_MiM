@@ -115,6 +115,7 @@ Command-line flags (each also mirrors an env var):
 | `-r`, `--max-retries` | `MIM_MAX_RETRIES` | `6` |
 | `--trace-keep` | `MIM_TRACE_KEEP` | `20` |
 | `-L`, `--license-details` | `MIM_LICENSE_DETAILS` | off |
+| `--metrics-file` | `MIM_METRICS_FILE` | `metrics.jsonl` next to `mim_proxy.py` |
 
 The proxy listens on `127.0.0.1:$MIM_PORT`. `GET /health` reports whether
 each dependency (gateway URL/key, SCA bearer, snippet script) is wired up,
@@ -250,9 +251,30 @@ proxy's `MIM_LOG_LEVEL`:
 |---|---|
 | `MIM_MCP_LOG_LEVEL` | `off` \| `warn` \| `info` (default) \| `debug`. `debug` adds a preview of the input and the matched (category, project, license) tuples. |
 | `MIM_MCP_LOG_FILE` | Absolute path to append log lines to, in addition to stderr. Recommended because MCP-subprocess stderr is often not visible in the client. |
+| `MIM_MCP_METRICS_FILE` | Absolute path for the per-call metrics JSONL file. Default: `mcp_metrics.jsonl` next to `mim_mcp.py`. Set to empty to disable. |
 
 Set either via the `env` block in `.mcp.json` or with `--env KEY=VALUE`
 flags on `claude mcp add`.
+
+**Metrics.** The server appends one JSON line per `scan_code` call to
+`$MIM_MCP_METRICS_FILE`, plus one `event: "startup"` line each time
+Claude Code (re)spawns the subprocess so the period covered by the file
+is unambiguous. Each call line has the schema:
+
+```json
+{"ts":"2026-08-25T14:00:00Z","call_id":"a1b2c3d4","tool":"scan_code","outcome":"clean","duration_ms":842,"nws":1450,"hits":0,"http_status":200}
+```
+
+Fields: `ts` — UTC call-start timestamp; `call_id` — matches the id in the
+server log lines so a metrics row can be cross-referenced; `outcome` —
+`clean` / `hits` / `skipped_small` / `rejected_large` / `scan_error`
+(subprocess/transport failure) / `scan_result_error` (SCA HTTP 4xx or
+malformed body); `nws` — non-whitespace char count of the input;
+`hits` — number of RECIPROCAL / WEAK_RECIPROCAL matches (0 when clean or
+skipped); `http_status` — SCA scan endpoint status (or `null`). Requests
+= line count; responses = requests (every call returns); the model's
+retry behavior after `hits` shows up as additional `scan_code` calls in
+subsequent lines.
 
 ## Required: install the policy directory as `.claude/` to force scanning on every response
 
@@ -388,6 +410,25 @@ pipeline did after the fact.
   requests, and `GET /traces/<trace_id>` returns the full event stream
   with monotonic `t_ms` offsets. Traces live in process memory only and
   are cleared on restart.
+- **Metrics file** — the proxy appends one JSON line per scanned request to
+  `$MIM_METRICS_FILE` (default `metrics.jsonl` next to `mim_proxy.py`), plus
+  one `event: "startup"` line each time the process boots so the period
+  covered by the file is unambiguous. Pass `--metrics-file ""` to disable.
+  Each request line has the schema:
+
+  ```json
+  {"ts":"2026-08-25T14:00:00Z","trace_id":"a1b2c3d4","channel":"anthropic_messages","outcome":"clean","duration_ms":4210,"attempts":3,"reprompts":2,"hits":0}
+  ```
+
+  Fields: `ts` — UTC request-start timestamp; `channel` — which entry point
+  produced the request (`proxy` / `chat_completions` / `anthropic_messages`);
+  `outcome` — `clean` / `give_up` / `no_code` / `gateway_error` / `scan_error`;
+  `attempts` — total LLM calls (initial + rewrites); `reprompts` — rewrite
+  attempts (`attempts - 1`); `hits` — reciprocal matches remaining in the
+  final response. Aggregate requests / responses / reprompts over any window
+  by tallying lines whose `ts` falls in that window (request count = line
+  count, response count = lines with `outcome` other than `gateway_error` /
+  `scan_error`, reprompt count = sum of `reprompts`).
 
 ## Troubleshooting
 
