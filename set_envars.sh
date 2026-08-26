@@ -8,6 +8,12 @@ export PATH=$JAVA_HOME/bin:$PATH
 #export BLACKDUCK_TOK=< replace with your personal Black Duck SCA key>
 export BLACKDUCK_HOST=https://sca.field-test.blackduck.com
 
+#BLACKDUCK_MCP_GATEWAY_URL   required   base URL of the LLM gateway
+export BLACKDUCK_MCP_GATEWAY_URL=https://llm.core.blackduck.com
+
+#BLACKDUCK_MCP_GATEWAY_KEY   required   LLM key sent as Bearer to the gateway
+#export BLACKDUCK_MCP_GATEWAY_KEY=<your gateway key>
+
 #--------------------------------------------------------------------
 # should not need to modify below here
 #--------------------------------------------------------------------

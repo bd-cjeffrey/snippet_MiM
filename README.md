@@ -31,7 +31,7 @@ chmod +x run_snippet_hash.sh set_envars.sh test_snippet_match.sh run_server.sh r
 
 ## Configure environment
 
-Modify set_envars.sh  to update environment variables
+Modify set_envars.sh  to update required environment variables
 
 Two sets of credentials are needed:
 
@@ -46,11 +46,11 @@ Two sets of credentials are needed:
    Edit `set_envars.sh` if you need to swap in a different `BLACKDUCK_TOK`
    or `BLACKDUCK_HOST`.
 
-2. **LLM gateway** (LiteLLM at `$BLACKDUCK_MCP_GATEWAY_URL`):
+2. **LLM gateway** (`$BLACKDUCK_MCP_GATEWAY_URL`):
 
    ```bash
    export BLACKDUCK_MCP_GATEWAY_URL="https://llm.core.blackduck.com"
-   export BLACKDUCK_MCP_GATEWAY_KEY="sk-...your-litellm-key..."
+   export BLACKDUCK_MCP_GATEWAY_KEY="sk-...your-llm-key..."
    ```
 
 3. **JAVA** modify the set_envars.sh script to set the JAVA_HOME
