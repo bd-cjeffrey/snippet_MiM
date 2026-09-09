@@ -5,10 +5,11 @@
 # file.
 #
 
-set -x
+#set -x
 
 source ./set_envars.sh
 
-./run_snippet_hash.sh ./test_code.c
+#./run_snippet_hash.sh ./test_code.c
+./run_snippet_hash.sh $1 
 
 cat ./snippet_match.json | jq

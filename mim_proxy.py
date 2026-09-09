@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, has_request_context, jsonify, request
 
 APP_DIR = Path(__file__).resolve().parent
 SCRIPT = APP_DIR / "run_snippet_hash.sh"
@@ -295,20 +295,48 @@ def _sanitize_upstream_body(body: dict, channel: str) -> tuple:
     return kept, sorted(dropped)
 
 
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
+    "content-encoding",
+}
+
+
+def _client_forward_headers() -> dict:
+    """Copy the current Flask request's headers minus hop-by-hop entries
+    and Authorization (we replace it with GATEWAY_KEY). Content-Type is
+    also dropped so callers can set it for the re-encoded JSON body.
+    Returns {} if there is no active request context (e.g. tests)."""
+    if not has_request_context():
+        return {}
+    out = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in HOP_BY_HOP or lk in ("authorization", "content-type"):
+            continue
+        out[k] = v
+    return out
+
+
 def forward_to_gateway(body: dict, endpoint: str) -> dict:
     """Forward the client's request body verbatim to `endpoint` on the
     upstream gateway (e.g. "/v1/messages" or "/v1/chat/completions") and
     return the parsed response JSON. Streaming to the upstream is always
     disabled — we need the full body buffered so we can scan it; if the
-    downstream client asked for SSE we re-emit our own stream after."""
+    downstream client asked for SSE we re-emit our own stream after.
+
+    Client headers are forwarded (minus hop-by-hop, Authorization, and
+    Content-Type) so upstream gates that key on `anthropic-version`,
+    `anthropic-beta`, `user-agent`, `x-stainless-*`, etc. — e.g. the
+    LiteLLM gateway's "claude_code application" check — still recognize
+    the request."""
     if not GATEWAY_URL:
         raise RuntimeError("BLACKDUCK_MCP_GATEWAY_URL is not set")
     if not GATEWAY_KEY:
         raise RuntimeError("BLACKDUCK_MCP_GATEWAY_KEY is not set")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {GATEWAY_KEY}",
-    }
+    headers = _client_forward_headers()
+    headers["Content-Type"] = "application/json"
+    headers["Authorization"] = f"Bearer {GATEWAY_KEY}"
     channel = "anthropic" if endpoint.endswith("/messages") else "openai"
     payload, dropped = _sanitize_upstream_body({**body, "stream": False}, channel)
     if dropped:
@@ -813,13 +841,6 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
 
     trace.finish("unreachable", channel=channel)
     return {"error": "unreachable", "trace_id": trace.id}, 500
-
-
-HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
-    "content-encoding",
-}
 
 
 def _passthrough(subpath: str):
