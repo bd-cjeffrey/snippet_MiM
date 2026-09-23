@@ -607,7 +607,7 @@ def _rewrite_user_turn(hits: list, detailed: bool) -> str:
     return (
         "Please rewrite the code with a materially different algorithm and "
         "control flow, significantly reworded comments (including banner "
-        "text), and renamed identifiers, taking a clean-room approach not "
+        "text), and renamed identifiers, not "
         "copied from open source."
     )
 
