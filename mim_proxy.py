@@ -57,8 +57,8 @@ LICENSE_DETAILS = os.environ.get("MIM_LICENSE_DETAILS", "").lower() in ("1", "tr
 
 SMALL_SNIPPET_LIMIT = 300
 LARGE_SNIPPET_LIMIT = 50000
-#TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # for test purposes, trigger all categories
-TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")
+TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # trigger on all OSS categories
+#TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")                          # trigger only on reciprical
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
 _LEVEL_MAP = {
@@ -605,8 +605,6 @@ def _rewrite_user_turn(hits: list, detailed: bool) -> str:
     it upstream."""
     listed = "\n".join(_format_hit(h, detailed) for h in hits[:20])
     return (
-        #"The previous response contained code that matches reciprocal / "
-        #"copyleft licensed source:\n" + listed + "\n\n"
         "Please rewrite the code with a materially different algorithm and "
         "control flow, significantly reworded comments (including banner "
         "text), and renamed identifiers, taking a clean-room approach not "
