@@ -13,7 +13,7 @@ Flow per request:
      is itself still below the 300 threshold, it is dropped (too small
      to yield useful matches). Each file is scanned by
      run_snippet_hash.sh.
-  4. If snippet_match.json reports RECIPROCAL or WEAK_RECIPROCAL matches,
+  4. If snippet_match.json reports OSS matches,
      re-prompt the gateway to rewrite the code without those matches.
   5. Repeat until clean or MIM_MAX_RETRIES exhausted (default 6).
 
