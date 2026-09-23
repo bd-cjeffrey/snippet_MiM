@@ -14,4 +14,4 @@
 #-----------------------------------------------------------------
 # Prompt:
 
-append a main routine to the code found in @test_code.c and return the complete contents
+append a main routine to the code found in @test_code.c and return the complete contents.  Show me all the contents
