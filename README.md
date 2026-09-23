@@ -1,12 +1,13 @@
 # MiM — Man-in-the-Middle License Guard
 
 A small HTTP proxy that sits between a coding agent and a LiteLLM-compatible
-LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It forwards prompts upstream and,
-for every fenced code block in the response, runs BlackDuck's snippet-matching
-API via `run_snippet_hash.sh`. If any match is classified as open source, eg `RECIPROCAL` or
-`WEAK_RECIPROCAL`, the proxy re-prompts the LLM to rewrite the code without
-matching. It gives up after 6 attempts and asks the caller to try a
-different prompt.
+LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It forwards prompts upstream and
+runs BlackDuck's snippet-matching API via `run_snippet_hash.sh` against the
+assistant's entire text response — prose, fenced code, raw code without
+fences, or any text-file content embedded in the reply. If any match is
+classified as open source, eg `RECIPROCAL` or `WEAK_RECIPROCAL`, the proxy
+re-prompts the LLM to rewrite the code without matching. It gives up after
+6 attempts and asks the caller to try a different prompt.
 
 There are 2 ways to run: either as a proxy service, or as an MCP.
 
@@ -134,8 +135,8 @@ The proxy exposes three shapes of endpoint:
 
 | Route | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible entry point. If the request carries a user message, the assistant text is scanned and possibly rewritten before being returned. If it only has system/tool messages, or the last user content is empty, the whole request is forwarded upstream unchanged. |
-| `POST /v1/messages` | Anthropic Messages API — used by Claude Code and other Anthropic-native clients. Same scan/rewrite behavior as `/v1/chat/completions`, but the response is wrapped in Anthropic shape (`{id: "msg_...", type: "message", content: [{type:"text", text:...}], stop_reason: "end_turn", ...}`). When the request carries `"stream": true`, the pipeline still runs to completion and the finished assistant text is re-emitted as an Anthropic-shape SSE stream (`message_start` → `content_block_start` → `content_block_delta` chunks → `content_block_stop` → `message_delta` → `message_stop`) so clients that require `text/event-stream` — Claude Code included — accept the reply on the first try. Tool-result follow-ups (last user message contains only `tool_result` blocks) are forwarded upstream unchanged. |
+| `POST /v1/chat/completions` | OpenAI-compatible entry point. Every request is forwarded upstream and the assistant text in the reply is scanned and possibly rewritten before being returned — including replies to tool follow-ups or system-only prompts. If the LLM's reply contains no scannable text (empty content, only `tool_calls`, or under the 300 non-whitespace-char size floor), the pipeline exits early with a `note` and the upstream response is returned unmodified. |
+| `POST /v1/messages` | Anthropic Messages API — used by Claude Code and other Anthropic-native clients. Same scan/rewrite behavior as `/v1/chat/completions`, but the response is wrapped in Anthropic shape (`{id: "msg_...", type: "message", content: [{type:"text", text:...}], stop_reason: "end_turn", ...}`). When the request carries `"stream": true`, the pipeline still runs to completion and the finished assistant text is re-emitted as an Anthropic-shape SSE stream (`message_start` → `content_block_start` → `content_block_delta` chunks → `content_block_stop` → `message_delta` → `message_stop`) so clients that require `text/event-stream` — Claude Code included — accept the reply on the first try. Tool-result follow-ups (last user message contains only `tool_result` blocks) are scanned too: the LLM's reply to a tool result can still contain source code, so the pipeline runs on every turn. Replies whose content is only `tool_use` blocks (no text) exit early via the empty-text short-circuit and are re-emitted verbatim. |
 | Any other path/method | Transparent reverse proxy to the upstream gateway. Handles `GET /v1/models`, session init, embeddings, tool-only chat completions, etc. Client `Authorization` is forwarded; if the client didn't send one, the proxy substitutes `BLACKDUCK_MCP_GATEWAY_KEY`. |
 | `POST /proxy` | Simple test entry — same scan pipeline as `/v1/chat/completions`, but takes `{"prompt": "..."}` (with optional text attachments — see below). Kept for direct CLI use. |
 
@@ -181,10 +182,11 @@ Response fields:
 - `response` — final assistant text
 - `attempts` — how many round trips to the LLM were made
 - `clean` — `true` if no reciprocal matches remain; `false` if we gave up
-- `history` — one entry per attempt (`code_blocks`, `files_scanned`, `hits`)
+- `history` — one entry per attempt (`response_chars`, `files_scanned`, `hits`)
 - `hits` — flat list of reciprocal matches (present only when `clean: false`)
 - `message` — user-facing note when the proxy exhausted retries
-- `note` — set when a response had no fenced code blocks (nothing to scan)
+- `note` — set when a response had no scannable text (empty reply, or under
+  the 300 non-whitespace-char size floor)
 
 ## Option 2: Use as an MCP tool
 
@@ -238,9 +240,10 @@ Confirm it's connected: launch `claude`, type `/mcp`. You should see
 | `clean` | `true` if no RECIPROCAL / WEAK_RECIPROCAL matches |
 | `hits` | list of `{category, project, version, license, spdx, ownership, path, source_start, source_end, matched_start, matched_end}` |
 | `summary` | one-line human-readable summary |
-| `http_status` | HTTP status from the SCA scan endpoint (or `null`) |
+| `http_status` | HTTP status from the SCA scan endpoint (or `null`; the last-observed status when the input was split into several requests) |
 | `skipped` | present and `true` when input was too small to scan (<300 non-ws chars) |
-| `error` | present when the scan itself failed (missing bearer, HTTP 4xx, malformed response, timeout) |
+| `error` | present when the scan itself failed (missing bearer, HTTP 4xx, malformed response, timeout) — or when every segment of a split input errored out |
+| `partial_errors` | present when the input was split into several requests and some (but not all) errored out; a list of `{idx, http_status, error}` for each failed segment |
 
 Concurrent invocations are safe — each scan runs in its own tempdir.
 
@@ -267,14 +270,21 @@ is unambiguous. Each call line has the schema:
 
 Fields: `ts` — UTC call-start timestamp; `call_id` — matches the id in the
 server log lines so a metrics row can be cross-referenced; `outcome` —
-`clean` / `hits` / `skipped_small` / `rejected_large` / `scan_error`
-(subprocess/transport failure) / `scan_result_error` (SCA HTTP 4xx or
-malformed body); `nws` — non-whitespace char count of the input;
-`hits` — number of RECIPROCAL / WEAK_RECIPROCAL matches (0 when clean or
-skipped); `http_status` — SCA scan endpoint status (or `null`). Requests
-= line count; responses = requests (every call returns); the model's
-retry behavior after `hits` shows up as additional `scan_code` calls in
-subsequent lines.
+`clean` / `hits` / `skipped_small` / `scan_error` (subprocess/transport
+failure) / `scan_result_error` (SCA HTTP 4xx or malformed body); `nws` —
+non-whitespace char count of the input; `hits` — number of RECIPROCAL /
+WEAK_RECIPROCAL matches (0 when clean or skipped); `http_status` — SCA
+scan endpoint status (or `null`; the last-observed status when the input
+was split across several requests). Requests = line count; responses =
+requests (every call returns); the model's retry behavior after `hits`
+shows up as additional `scan_code` calls in subsequent lines.
+
+Inputs larger than the SCA snippet-matching endpoint's per-request cap
+(50000 non-whitespace chars) are split at line boundaries and scanned as
+several requests under a single `scan_code` call — matching the proxy's
+behaviour. When some segments succeed and others error out, `hits` from
+the successful segments are returned and the failures are reported in
+a `partial_errors` list on the tool result.
 
 ## Required: install the policy directory as `.claude/` to force scanning on every response
 
@@ -365,28 +375,27 @@ directory where the enforcement is missing.
 
 1. `POST /proxy` forwards `{model, messages: [{role: user, content: prompt}]}`
    to `${BLACKDUCK_MCP_GATEWAY_URL}/v1/chat/completions`.
-2. Fenced code blocks in the assistant's reply are pulled out with a regex.
-   If the model returns raw code without fences (e.g., Claude Opus 4.7), the
-   whole response is scanned instead and a `no_fences_using_whole_response`
-   trace event is emitted.
-3. Snippet size is measured in non-whitespace characters:
-   - Blocks with ≥ 300 non-whitespace chars are scanned individually.
-   - Blocks with > 50000 non-whitespace chars are split at line boundaries
-     into segments each within the cap so every request stays under the
-     snippet-matching endpoint's limit.
-   - Smaller blocks are concatenated together and scanned as a single
-     file — but only if the merged blob itself reaches the 300
-     non-whitespace-char threshold, otherwise it's dropped (too small to
-     yield useful matches).
+2. The assistant's entire text response is taken as the scan target — prose,
+   fenced code, raw code without fences, and any text-file content the model
+   embedded in its reply. Non-text content blocks (`tool_use`, etc.) are
+   passed through untouched.
+3. Response size is measured in non-whitespace characters:
+   - A response with < 300 non-whitespace chars is dropped (too small to
+     yield useful matches) and a `below_scan_threshold` trace event is
+     emitted with a `note` in the response.
+   - A response with > 50000 non-whitespace chars is split at line
+     boundaries into segments each within the cap so every request stays
+     under the snippet-matching endpoint's limit.
+   - Otherwise the response is scanned as a single file.
 
    Each resulting file is written to a fresh tempdir and
    `run_snippet_hash.sh` is invoked there (so the repo's
    `snippet_match.json` isn't clobbered).
 4. `find_reciprocal_matches` walks `snippetMatches.RECIPROCAL` and
    `snippetMatches.WEAK_RECIPROCAL` and flattens hits.
-5. If any hit is found, `build_rewrite_prompt` prepends the match list plus a
-   rewrite instruction to the original prompt and previous response, and the
-   loop iterates. After `MIM_MAX_RETRIES` failed rewrites the proxy returns
+5. If any hit is found, the assistant's prior response is appended to the
+   conversation along with a user turn asking for a rewrite, and the loop
+   iterates. After `MIM_MAX_RETRIES` failed rewrites the proxy returns
    `clean: false` with a message telling the caller to try a different prompt.
 
 With `-L` / `--license-details` (or `MIM_LICENSE_DETAILS=1`) the proxy
@@ -439,9 +448,10 @@ pipeline did after the fact.
 - **`snippet_match.json not produced`** — `run_snippet_hash.sh` failed. Check
   `BEARER_TOK` and `BLACKDUCK_HOST`; re-source `set_envars.sh` (the
   bearer is short-lived).
-- **`note: no fenced code blocks; nothing scanned`** — the LLM's reply had no
-  ` ```lang ... ``` ` blocks, so there was nothing to check. Ask for code in a
-  fenced block, or refine the prompt.
+- **`note: assistant response has fewer than 300 non-whitespace chars; too
+  small to scan`** — the LLM's reply was under the snippet-matching
+  endpoint's size floor, so there was nothing worth checking. Ask for a
+  larger code sample, or refine the prompt.
 - **`clean: false` after retries** — the model kept producing overlapping
   copyleft code. Try rephrasing the request from a different angle or asking
   for a permissively-licensed approach explicitly.

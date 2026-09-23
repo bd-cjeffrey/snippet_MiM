@@ -51,9 +51,9 @@ logging.basicConfig(
 )
 
 from mim_proxy import (  # noqa: E402
-    LARGE_SNIPPET_LIMIT,
     SMALL_SNIPPET_LIMIT,
     find_reciprocal_matches,
+    group_snippets,
     scan_error_message,
     scan_file,
 )
@@ -100,20 +100,33 @@ def _non_ws_len(s: str) -> int:
 
 @mcp.tool()
 def scan_code(code: str) -> dict:
-    """Scan a code snippet against Black Duck's snippet-match KnowledgeBase
-    and report reciprocal/copyleft license hits.
+    """Scan text against Black Duck's snippet-match KnowledgeBase and report
+    reciprocal/copyleft license hits.
+
+    The full input is scanned end-to-end — prose, fenced code, raw code
+    without fences, and any text-file content the caller included are all
+    checked. Inputs larger than the SCA endpoint's per-request cap
+    (LARGE_SNIPPET_LIMIT non-ws chars) are split at line boundaries and
+    scanned as several requests under one call.
 
     Returns a dict:
-      clean         -- true if no RECIPROCAL / WEAK_RECIPROCAL matches.
-      hits          -- list of {category, project, version, license, spdx,
-                       ownership, path, source_start, source_end,
-                       matched_start, matched_end}. Empty when clean.
-      summary       -- one-line human-readable summary.
-      http_status   -- HTTP status code from the SCA scan endpoint (int or null).
-      skipped       -- present and true when the input was too small to scan
-                       (<300 non-whitespace chars).
-      error         -- present when the scan itself failed (missing bearer,
-                       HTTP 4xx from SCA, malformed response, subprocess timeout).
+      clean          -- true if no RECIPROCAL / WEAK_RECIPROCAL matches.
+      hits           -- list of {category, project, version, license, spdx,
+                        ownership, path, source_start, source_end,
+                        matched_start, matched_end}. Empty when clean.
+      summary        -- one-line human-readable summary.
+      http_status    -- HTTP status code from the SCA scan endpoint (int or
+                        null; the last-observed status when the input was
+                        split into several requests).
+      skipped        -- present and true when the input was too small to
+                        scan (<300 non-whitespace chars).
+      error          -- present when the scan itself failed (missing bearer,
+                        HTTP 4xx from SCA, malformed response, subprocess
+                        timeout) or when every segment of a split input
+                        errored out.
+      partial_errors -- present when the input was split and some (but not
+                        all) segments errored out; a list of
+                        {idx, http_status, error} for each failed segment.
 
     Concurrent calls are safe: each invocation runs in its own tempdir.
     """
@@ -146,72 +159,79 @@ def scan_code(code: str) -> dict:
             "summary": f"input too small to scan ({nws} < {SMALL_SNIPPET_LIMIT} non-ws chars)",
             "http_status": None,
         }
-    if nws > LARGE_SNIPPET_LIMIT:
-        log.info("scan_skipped reason=too_large nws=%d limit=%d", nws, LARGE_SNIPPET_LIMIT)
-        _finish("rejected_large")
-        return {
-            "clean": False,
-            "hits": [],
-            "error": (
-                f"input too large ({nws} non-ws chars > {LARGE_SNIPPET_LIMIT}); "
-                "split the code into smaller chunks and call scan_code once per chunk"
-            ),
-            "summary": "input rejected: too large",
-            "http_status": None,
-        }
 
-    log.info("scan_start nws=%d", nws)
+    # Split at line boundaries if the input exceeds the SCA endpoint's cap,
+    # so a large blob (e.g. an entire assistant response) is scanned end to
+    # end instead of rejected. Matches the proxy's behaviour.
+    files = group_snippets([code])
+    log.info("scan_start nws=%d files=%d", nws, len(files))
     t0 = time.monotonic()
-    try:
-        result = scan_file(code)
-    except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        elapsed = int((time.monotonic() - t0) * 1000)
-        log.warning("scan_error ms=%d err=%s", elapsed, e)
-        _finish("scan_error")
-        return {
-            "clean": False,
-            "hits": [],
-            "error": str(e),
-            "summary": "scan failed",
-            "http_status": None,
-        }
+
+    scan_results: list = []
+    scan_errors: list = []
+    last_http_status = None
+    for idx, chunk in enumerate(files):
+        try:
+            r = scan_file(chunk)
+        except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            log.warning("scan_error idx=%d ms=%d err=%s", idx, elapsed, e)
+            _finish("scan_error", http_status=last_http_status)
+            return {
+                "clean": False,
+                "hits": [],
+                "error": str(e),
+                "summary": "scan failed",
+                "http_status": last_http_status,
+            }
+        http_status = r.get("_http_status") if isinstance(r, dict) else None
+        if http_status is not None:
+            last_http_status = http_status
+        err = scan_error_message(r)
+        if err:
+            log.info("scan_result_error idx=%d http_status=%s err=%s",
+                     idx, http_status, err[:200])
+            scan_errors.append({"idx": idx, "http_status": http_status, "error": err})
+        else:
+            scan_results.append(r)
 
     elapsed = int((time.monotonic() - t0) * 1000)
-    http_status = result.get("_http_status") if isinstance(result, dict) else None
-    err = scan_error_message(result)
-    if err:
-        log.info("scan_result_error ms=%d http_status=%s err=%s",
-                 elapsed, http_status, err[:200])
-        _finish("scan_result_error", http_status=http_status)
+    if scan_errors and not scan_results:
+        first = scan_errors[0]
+        _finish("scan_result_error", http_status=last_http_status)
         return {
             "clean": False,
             "hits": [],
-            "error": err,
+            "error": first["error"],
             "summary": "scan returned an error",
-            "http_status": http_status,
+            "http_status": last_http_status,
         }
 
-    hits = find_reciprocal_matches([result])
+    hits = find_reciprocal_matches(scan_results)
     if hits:
-        log.info("scan_ok ms=%d http_status=%s hits=%d",
-                 elapsed, http_status, len(hits))
+        log.info("scan_ok ms=%d files=%d http_status=%s hits=%d",
+                 elapsed, len(files), last_http_status, len(hits))
         sample = [(h.get("category"), h.get("project"), h.get("license")) for h in hits[:3]]
         log.info("rewrite_required hits=%d sample=%r", len(hits), sample)
         log.debug("hits detail: %r",
                   [(h.get("category"), h.get("project"), h.get("license")) for h in hits])
-        _finish("hits", hits=len(hits), http_status=http_status)
+        _finish("hits", hits=len(hits), http_status=last_http_status)
     else:
-        log.info("scan_ok ms=%d http_status=%s clean", elapsed, http_status)
-        _finish("clean", http_status=http_status)
-    return {
+        log.info("scan_ok ms=%d files=%d http_status=%s clean",
+                 elapsed, len(files), last_http_status)
+        _finish("clean", http_status=last_http_status)
+    result_out = {
         "clean": not hits,
         "hits": hits,
         "summary": (
             f"{len(hits)} reciprocal/weak-reciprocal match(es)"
             if hits else "no reciprocal matches"
         ),
-        "http_status": http_status,
+        "http_status": last_http_status,
     }
+    if scan_errors:
+        result_out["partial_errors"] = scan_errors
+    return result_out
 
 
 if __name__ == "__main__":

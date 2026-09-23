@@ -4,15 +4,14 @@ MitM proxy: sits between a coding agent and an LLM (MCP gateway).
 
 Flow per request:
   1. POST /proxy {"prompt": "..."}  ->  forward to $BLACKDUCK_MCP_GATEWAY_URL
-  2. Extract fenced code blocks from the response; if none are present
-     (e.g., Claude Opus emits raw code), fall back to the whole response.
-  3. Snippets with < 300 non-whitespace chars are concatenated into a
-     single file; larger blocks get their own file; blocks whose
-     non-whitespace length exceeds 50000 are split at line boundaries
-     into segments each within the cap. If the concatenated small file
-     is itself still below the 300 threshold, it is dropped (too small
-     to yield useful matches). Each file is scanned by
-     run_snippet_hash.sh.
+  2. Treat the assistant's entire text response as the scan target —
+     prose, fenced code, or raw code without fences. Any text file
+     content that comes back embedded in the response is included.
+  3. The response text is measured in non-whitespace characters:
+     if it exceeds 50000 non-ws chars it is split at line boundaries
+     into segments each within the cap; if it is below the 300
+     non-ws threshold it is dropped (too small to yield useful
+     matches). Each resulting file is scanned by run_snippet_hash.sh.
   4. If snippet_match.json reports OSS matches,
      re-prompt the gateway to rewrite the code without those matches.
   5. Repeat until clean or MIM_MAX_RETRIES exhausted (default 6).
@@ -32,7 +31,6 @@ import binascii
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -59,7 +57,6 @@ SMALL_SNIPPET_LIMIT = 300
 LARGE_SNIPPET_LIMIT = 50000
 TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # trigger on all OSS categories
 #TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")                          # trigger only on reciprical
-FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
 _LEVEL_MAP = {
     "off": logging.CRITICAL + 10,
@@ -385,10 +382,6 @@ def _last_user_text(body: dict) -> str:
     return ""
 
 
-def extract_code_blocks(text: str) -> list:
-    return [m.group(1) for m in FENCE_RE.finditer(text)]
-
-
 def _non_ws_len(s: str) -> int:
     """Count of non-whitespace characters in `s`."""
     return sum(1 for c in s if not c.isspace())
@@ -688,12 +681,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             resp_chars=len(response_text),
         )
 
-        blocks = extract_code_blocks(response_text)
-        source = "fenced"
-        if not blocks and response_text.strip():
-            blocks = [response_text]
-            source = "whole_response"
-        if not blocks:
+        if not response_text.strip():
             trace.event("empty_response", side=SIDE_SERVER)
             trace.finish("no_code", channel=channel, attempts=attempt + 1)
             return {
@@ -704,16 +692,28 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
                 "note": "no scannable text in assistant response",
             }, 200
 
-        files = group_snippets(blocks)
-        if source == "whole_response":
-            trace.event("no_fences_using_whole_response", side=SIDE_SERVER, chars=len(response_text))
+        files = group_snippets([response_text])
         trace.event(
-            "code_blocks",
+            "scan_targets",
             side=SIDE_SCANNER,
-            found=len(blocks),
+            resp_chars=len(response_text),
             files=len(files),
             sizes=[len(f) for f in files],
         )
+        if not files:
+            trace.event("below_scan_threshold", side=SIDE_SCANNER,
+                        nonws=_non_ws_len(response_text), min=SMALL_SNIPPET_LIMIT)
+            trace.finish("no_code", channel=channel, attempts=attempt + 1)
+            return {
+                "response_body": response_body,
+                "attempts": attempt + 1,
+                "history": history,
+                "trace_id": trace.id,
+                "note": (
+                    f"assistant response has fewer than {SMALL_SNIPPET_LIMIT} "
+                    "non-whitespace chars; too small to scan"
+                ),
+            }, 200
         try:
             scan_results = []
             scan_errors: list = []
@@ -778,7 +778,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
         hits = find_reciprocal_matches(scan_results)
         history_entry = {
             "attempt": attempt + 1,
-            "code_blocks": len(blocks),
+            "response_chars": len(response_text),
             "files_scanned": len(files),
             "hits": len(hits),
         }
@@ -1032,10 +1032,6 @@ def chat_completions():
     body = request.get_json(silent=True) or {}
     messages = body.get("messages") or []
     user_msgs = [m for m in messages if m.get("role") == "user"]
-    prompt = _extract_user_text(user_msgs[-1]).strip() if user_msgs else ""
-    if not prompt:
-        log.info("[%s] chat_completions passthrough (no user prompt)", SIDE_CLIENT)
-        return _passthrough("v1/chat/completions")
 
     request_fields = {
         "channel": "chat_completions",
@@ -1068,13 +1064,6 @@ def anthropic_messages():
     stream = bool(body.get("stream"))
     messages = body.get("messages") or []
     user_msgs = [m for m in messages if m.get("role") == "user"]
-    # Anthropic user messages can carry tool_result content (no `type:"text"`
-    # parts); those aren't user prompts, so _extract_user_text returns empty
-    # and we fall through to passthrough.
-    prompt = _extract_user_text(user_msgs[-1]).strip() if user_msgs else ""
-    if not prompt:
-        log.info("[%s] anthropic_messages passthrough (no user text)", SIDE_CLIENT)
-        return _passthrough("v1/messages")
 
     request_fields = {
         "channel": "anthropic_messages",
