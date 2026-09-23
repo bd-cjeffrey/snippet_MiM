@@ -3,9 +3,9 @@
 A small HTTP proxy that sits between a coding agent and a LiteLLM-compatible
 LLM gateway (`$BLACKDUCK_MCP_GATEWAY_URL`). It forwards prompts upstream and,
 for every fenced code block in the response, runs BlackDuck's snippet-matching
-API via `run_snippet_hash.sh`. If any match is classified as `RECIPROCAL` or
+API via `run_snippet_hash.sh`. If any match is classified as open source, eg `RECIPROCAL` or
 `WEAK_RECIPROCAL`, the proxy re-prompts the LLM to rewrite the code without
-those matches. It gives up after 6 attempts and asks the caller to try a
+matching. It gives up after 6 attempts and asks the caller to try a
 different prompt.
 
 There are 2 ways to run: either as a proxy service, or as an MCP.
