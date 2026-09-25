@@ -268,6 +268,7 @@ def inline_attachments(prompt: str, attachments: list) -> str:
 ANTHROPIC_ALLOWED_FIELDS = frozenset({
     "model", "messages", "system", "max_tokens", "tools", "tool_choice",
     "temperature", "top_p", "top_k", "stop_sequences", "metadata", "stream",
+    "user",
 })
 
 OPENAI_ALLOWED_FIELDS = frozenset({
@@ -290,6 +291,21 @@ def _sanitize_upstream_body(body: dict, channel: str) -> tuple:
         else:
             dropped.append(k)
     return kept, sorted(dropped)
+
+
+def _ensure_user_field(body: dict, channel: str) -> dict:
+    # LiteLLM gateways require a top-level `user` for request tracking and
+    # reject the call with `You must pass a 'user' json field to your request`
+    # otherwise. Prefer whatever the client sent; fall back to Anthropic's
+    # metadata.user_id, then a stable proxy-identifying string.
+    if body.get("user"):
+        return body
+    fallback = None
+    if channel == "anthropic":
+        meta = body.get("metadata")
+        if isinstance(meta, dict):
+            fallback = meta.get("user_id")
+    return {**body, "user": fallback or "mim-proxy"}
 
 
 HOP_BY_HOP = {
@@ -335,7 +351,8 @@ def forward_to_gateway(body: dict, endpoint: str) -> dict:
     headers["Content-Type"] = "application/json"
     headers["Authorization"] = f"Bearer {GATEWAY_KEY}"
     channel = "anthropic" if endpoint.endswith("/messages") else "openai"
-    payload, dropped = _sanitize_upstream_body({**body, "stream": False}, channel)
+    prepared = _ensure_user_field({**body, "stream": False}, channel)
+    payload, dropped = _sanitize_upstream_body(prepared, channel)
     if dropped:
         log.info("[%s] dropped %d field(s) not in %s upstream schema: %s",
                  SIDE_SERVER, len(dropped), channel, dropped)
