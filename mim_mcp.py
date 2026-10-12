@@ -54,6 +54,7 @@ from mim_proxy import (  # noqa: E402
     SMALL_SNIPPET_LIMIT,
     find_reciprocal_matches,
     group_snippets,
+    is_fingerprint_size_error,
     scan_error_message,
     scan_file,
     start_bearer_refresher,
@@ -198,6 +199,21 @@ def scan_code(code: str) -> dict:
 
     elapsed = int((time.monotonic() - t0) * 1000)
     if scan_errors and not scan_results:
+        if all(is_fingerprint_size_error(e["error"]) for e in scan_errors):
+            for e in scan_errors:
+                log.info(
+                    "fingerprint-size rejection; forwarding LLM response unchanged: %s",
+                    e["error"],
+                )
+            _finish("fingerprint_size_bypass", http_status=last_http_status)
+            return {
+                "clean": True,
+                "hits": [],
+                "skipped": True,
+                "summary": "snippet scan rejected input size; forwarded unchanged",
+                "http_status": last_http_status,
+                "partial_errors": scan_errors,
+            }
         first = scan_errors[0]
         _finish("scan_result_error", http_status=last_http_status)
         return {

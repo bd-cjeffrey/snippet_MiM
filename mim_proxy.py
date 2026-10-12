@@ -56,6 +56,7 @@ LICENSE_DETAILS = os.environ.get("MIM_LICENSE_DETAILS", "").lower() in ("1", "tr
 SMALL_SNIPPET_LIMIT = 300
 LARGE_SNIPPET_LIMIT = 50000
 TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # trigger on all OSS categories
+FINGERPRINT_SIZE_MARKER = "Code fingerprints must be between"
 #TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")                          # trigger only on reciprical
 
 # The SCA /api/tokens/authenticate bearer is short-lived (typically ~2h).
@@ -624,6 +625,14 @@ def scan_error_message(result) -> str:
     return ""
 
 
+def is_fingerprint_size_error(err: str) -> bool:
+    """True if `err` is Black Duck's fingerprint-size rejection
+    ("Code fingerprints must be between 8 and 35000 ..."). Those responses
+    aren't actionable — the input simply fell outside the SCA endpoint's
+    accepted range — so we log and forward the LLM response unchanged."""
+    return bool(err) and FINGERPRINT_SIZE_MARKER in err
+
+
 def _first(lst):
     return lst[0] if isinstance(lst, list) and lst else None
 
@@ -867,6 +876,24 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
             }, 500
 
         if scan_errors and len(scan_errors) == len(files):
+            if all(is_fingerprint_size_error(e["error"]) for e in scan_errors):
+                for e in scan_errors:
+                    log.info(
+                        "[%s] [%s] fingerprint-size rejection; forwarding LLM response unchanged: %s",
+                        SIDE_SCANNER, trace.id, e["error"],
+                    )
+                trace.event("fingerprint_size_bypass",
+                            side=SIDE_SCANNER, count=len(scan_errors))
+                trace.finish("fingerprint_size_bypass",
+                             channel=channel, attempts=attempt + 1)
+                return {
+                    "response_body": response_body,
+                    "attempts": attempt + 1,
+                    "history": history,
+                    "scan_errors": scan_errors,
+                    "trace_id": trace.id,
+                    "note": "snippet scan rejected input size; forwarded LLM response unchanged",
+                }, 200
             trace.event("scan_all_failed", side=SIDE_SCANNER, count=len(scan_errors))
             trace.finish("scan_error", channel=channel, attempts=attempt + 1)
             return {
@@ -1199,6 +1226,11 @@ def anthropic_messages():
             mimetype="text/event-stream",
         )
     return jsonify(response_body), status
+
+
+@app.route("/api/hello", methods=["HEAD"])
+def api_hello():
+    return ("", 200, {"X-MIM-Status": "ok"})
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
