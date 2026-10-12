@@ -58,6 +58,14 @@ LARGE_SNIPPET_LIMIT = 50000
 TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL", "PERMISSIVE", "UNKNOWN")  # trigger on all OSS categories
 #TRIGGER_CATEGORIES = ("RECIPROCAL", "WEAK_RECIPROCAL")                          # trigger only on reciprical
 
+# The SCA /api/tokens/authenticate bearer is short-lived (typically ~2h).
+# A long-running proxy or MCP subprocess that only sources set_envars.sh at
+# launch will start returning HTTP 401 from run_snippet_hash.sh once the
+# bearer expires. The background refresher below exchanges BLACKDUCK_TOK
+# for a fresh bearer every BEARER_REFRESH_SEC and updates os.environ so
+# the next subprocess inherits the new value.
+BEARER_REFRESH_SEC = int(os.environ.get("MIM_BEARER_REFRESH_SEC", "3600"))
+
 _LEVEL_MAP = {
     "off": logging.CRITICAL + 10,
     "warn": logging.WARNING,
@@ -108,6 +116,83 @@ SIDE_CLIENT = "CLIENT "   # proxy <-> the coding agent (or curl) that called us
 SIDE_SERVER = "SERVER "   # proxy <-> the upstream LLM gateway
 SIDE_SCANNER = "SCANNER"  # proxy <-> the Black Duck snippet-matching endpoint
 SIDE_NONE = "       "     # untagged lines (framework/startup output)
+
+
+def refresh_bearer_token() -> bool:
+    """Exchange BLACKDUCK_TOK for a fresh short-lived bearer and update
+    os.environ['BEARER_TOK'] in place. Returns True on success.
+
+    Mirrors the curl/jq handshake in set_envars.sh so subprocesses
+    (run_snippet_hash.sh) spawned by scan_file inherit the refreshed
+    bearer on their next invocation.
+    """
+    pat = os.environ.get("BLACKDUCK_TOK")
+    host = (os.environ.get("BLACKDUCK_HOST") or "").rstrip("/")
+    if not pat or not host:
+        log.warning(
+            "[%s] bearer refresh skipped: BLACKDUCK_TOK=%s BLACKDUCK_HOST=%s",
+            SIDE_SCANNER, bool(pat), bool(host),
+        )
+        return False
+    try:
+        resp = requests.post(
+            f"{host}/api/tokens/authenticate",
+            headers={"Accept": "application/vnd.blackducksoftware.user-4+json",
+                     "Authorization": f"token {pat}"},
+            timeout=30,
+            verify=False,
+        )
+    except requests.RequestException as e:
+        log.warning("[%s] bearer refresh request failed: %s", SIDE_SCANNER, e)
+        return False
+    if resp.status_code >= 400:
+        log.warning(
+            "[%s] bearer refresh HTTP %d: %s",
+            SIDE_SCANNER, resp.status_code, resp.text[:200],
+        )
+        return False
+    try:
+        token = (resp.json() or {}).get("bearerToken")
+    except ValueError as e:
+        log.warning("[%s] bearer refresh: non-JSON response: %s", SIDE_SCANNER, e)
+        return False
+    if not token:
+        log.warning("[%s] bearer refresh: no bearerToken in response", SIDE_SCANNER)
+        return False
+    os.environ["BEARER_TOK"] = token
+    log.info("[%s] bearer refreshed (next refresh in %ds)",
+             SIDE_SCANNER, BEARER_REFRESH_SEC)
+    return True
+
+
+_BEARER_REFRESHER_STARTED = False
+_BEARER_REFRESHER_LOCK = threading.Lock()
+
+
+def start_bearer_refresher(interval_sec: int = None) -> None:
+    """Start a daemon thread that refreshes BEARER_TOK every `interval_sec`.
+    Idempotent: a second call is a no-op so both mim_proxy.py and mim_mcp.py
+    can call it on startup without doubling up.
+    """
+    global _BEARER_REFRESHER_STARTED
+    with _BEARER_REFRESHER_LOCK:
+        if _BEARER_REFRESHER_STARTED:
+            return
+        _BEARER_REFRESHER_STARTED = True
+
+    period = interval_sec if interval_sec is not None else BEARER_REFRESH_SEC
+
+    def _loop():
+        while True:
+            time.sleep(period)
+            try:
+                refresh_bearer_token()
+            except Exception as e:
+                log.warning("[%s] bearer refresher loop error: %s", SIDE_SCANNER, e)
+
+    t = threading.Thread(target=_loop, name="bearer-refresher", daemon=True)
+    t.start()
+    log.info("[%s] bearer refresher started (interval=%ds)", SIDE_SCANNER, period)
 
 
 class Trace:
@@ -1238,4 +1323,5 @@ if __name__ == "__main__":
 
     port = args.port if args.port is not None else int(os.environ.get("MIM_PORT", "8080"))
     _log_metric({"event": "startup", "ts": _now_iso(), "pid": os.getpid(), "port": port})
+    start_bearer_refresher()
     app.run(host="127.0.0.1", port=port, debug=False)

@@ -47,6 +47,17 @@ Two sets of credentials are needed:
    Edit `set_envars.sh` if you need to swap in a different `BLACKDUCK_TOK`
    or `BLACKDUCK_HOST`.
 
+   The SCA bearer is short-lived (typically ~2 hours), so both the proxy
+   (`mim_proxy.py`) and the MCP server (`mim_mcp.py`) start a background
+   thread that re-exchanges `BLACKDUCK_TOK` for a fresh bearer every
+   hour and updates `BEARER_TOK` in-process. Subprocesses spawned by the
+   scan pipeline inherit the refreshed value, so long-running sessions
+   no longer need to be restarted when the bearer expires. For this to
+   work, `BLACKDUCK_TOK` and `BLACKDUCK_HOST` must remain exported in
+   the environment the server was launched from — `source set_envars.sh`
+   handles that. Override the interval (in seconds) via
+   `MIM_BEARER_REFRESH_SEC` if needed (default `3600`).
+
 2. **LLM gateway** (`$BLACKDUCK_MCP_GATEWAY_URL`):
 
    ```bash
@@ -213,9 +224,13 @@ claude mcp add bd_llm_traffic_scan "$PWD/run_mcp.sh"
 
 `run_mcp.sh` re-sources `set_envars.sh` on each launch, so the
 short-lived `BEARER_TOK` is refreshed whenever Claude Code (re)spawns the
-subprocess. `BLACKDUCK_HOST` is set the same way. The server still starts
-without these — every `scan_code` call just returns a structured `error`
-field until they're present.
+subprocess. `BLACKDUCK_HOST` is set the same way. In addition, the MCP
+server starts a background thread that re-exchanges `BLACKDUCK_TOK` for
+a fresh bearer once an hour (overridable via `MIM_BEARER_REFRESH_SEC`),
+so a long-lived subprocess doesn't start returning HTTP 401 mid-session
+when the SCA bearer expires. The server still starts without these —
+every `scan_code` call just returns a structured `error` field until
+they're present.
 
 Project-scoped alternative — drop this in `.mcp.json` at the repo root
 where you want the tool available:

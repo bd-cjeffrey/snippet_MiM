@@ -56,6 +56,7 @@ from mim_proxy import (  # noqa: E402
     group_snippets,
     scan_error_message,
     scan_file,
+    start_bearer_refresher,
 )
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
@@ -241,4 +242,5 @@ if __name__ == "__main__":
         "pid": os.getpid(),
         "log_level": LOG_LEVEL_NAME,
     })
+    start_bearer_refresher()
     mcp.run()
