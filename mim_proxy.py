@@ -637,7 +637,7 @@ def _first(lst):
     return lst[0] if isinstance(lst, list) and lst else None
 
 
-def find_reciprocal_matches(scan_results: list) -> list:
+def find_matches(scan_results: list) -> list:
     hits = []
     for r in scan_results:
         matches = r.get("snippetMatches", {}) or {}
@@ -703,7 +703,7 @@ def _format_hit(h: dict, detailed: bool) -> str:
 
 def _rewrite_user_turn(hits: list, detailed: bool) -> str:
     """Content of the follow-up user message appended to the conversation
-    when the scan finds reciprocal matches. Naming the matched projects /
+    when the scan finds license matches. Naming the matched projects /
     licenses in the message body lets the model actually target them —
     the previous prompt-rewriting hack computed this list but never sent
     it upstream."""
@@ -904,7 +904,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
                 "trace_id": trace.id,
             }, 502
 
-        hits = find_reciprocal_matches(scan_results)
+        hits = find_matches(scan_results)
         history_entry = {
             "attempt": attempt + 1,
             "response_chars": len(response_text),
@@ -954,7 +954,7 @@ def run_pipeline(body: dict, channel: str, request_fields: dict = None) -> tuple
                 "trace_id": trace.id,
                 "message": (
                     f"Gave up after {MAX_RETRIES} rewrite attempts — the model "
-                    "keeps producing code with reciprocal/copyleft matches. "
+                    "keeps producing code with license matches. "
                     "Please try a different prompt."
                 ),
             }, 200
@@ -1285,7 +1285,7 @@ def _parse_args(argv):
     import argparse
     p = argparse.ArgumentParser(
         prog="mim_proxy",
-        description="MitM proxy: scans LLM code for reciprocal/copyleft matches "
+        description="MitM proxy: scans LLM code for license matches "
                     "and re-prompts on hits.",
     )
     p.add_argument(
