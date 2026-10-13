@@ -2,7 +2,7 @@
 """MCP stdio server exposing Black Duck snippet-match as a tool.
 
 Wraps the same scan primitive that mim_proxy.py uses (`scan_file`) so a
-Claude Code session can check code for reciprocal/copyleft license matches
+Claude Code session can check code for license matches
 without needing to be routed through the HTTP proxy. Claude decides when
 to call the tool and how to react to the result.
 
@@ -52,7 +52,7 @@ logging.basicConfig(
 
 from mim_proxy import (  # noqa: E402
     SMALL_SNIPPET_LIMIT,
-    find_reciprocal_matches,
+    find_matches,
     group_snippets,
     is_fingerprint_size_error,
     scan_error_message,
@@ -103,7 +103,7 @@ def _non_ws_len(s: str) -> int:
 @mcp.tool()
 def scan_code(code: str) -> dict:
     """Scan text against Black Duck's snippet-match KnowledgeBase and report
-    reciprocal/copyleft license hits.
+    any matches.
 
     The full input is scanned end-to-end — prose, fenced code, raw code
     without fences, and any text-file content the caller included are all
@@ -112,7 +112,7 @@ def scan_code(code: str) -> dict:
     scanned as several requests under one call.
 
     Returns a dict:
-      clean          -- true if no RECIPROCAL / WEAK_RECIPROCAL matches.
+      clean          -- true if no matches found.
       hits           -- list of {category, project, version, license, spdx,
                         ownership, path, source_start, source_end,
                         matched_start, matched_end}. Empty when clean.
@@ -224,7 +224,7 @@ def scan_code(code: str) -> dict:
             "http_status": last_http_status,
         }
 
-    hits = find_reciprocal_matches(scan_results)
+    hits = find_matches(scan_results)
     if hits:
         log.info("scan_ok ms=%d files=%d http_status=%s hits=%d",
                  elapsed, len(files), last_http_status, len(hits))
@@ -241,8 +241,8 @@ def scan_code(code: str) -> dict:
         "clean": not hits,
         "hits": hits,
         "summary": (
-            f"{len(hits)} reciprocal/weak-reciprocal match(es)"
-            if hits else "no reciprocal matches"
+            f"{len(hits)} license match(es)"
+            if hits else "no license matches"
         ),
         "http_status": last_http_status,
     }
